@@ -1,6 +1,7 @@
 import { Router, Response } from 'express'
 import { supabaseAdmin } from '../lib/supabaseAdmin'
 import { authApiKey, AuthenticatedRequest } from '../middleware/authApiKey'
+import { checkEmailLimit, incrementEmailCounter } from '../middleware/checkPlanLimits'
 import { sendEmail } from '../services/email.service'
 
 const router = Router()
@@ -15,188 +16,153 @@ function applyVariables(html: string, vars: Record<string, string>) {
     const regex = new RegExp(`{{${key}}}`, 'g')
     result = result.replace(regex, vars[key])
   })
-  console.log('Applied variables, final HTML:', result.substring(0, 100))
   return result
 }
 
-router.post('/', authApiKey, async (req: AuthenticatedRequest, res: Response) => {
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/send
+// Single email send
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/', authApiKey, checkEmailLimit, async (req: AuthenticatedRequest, res: Response) => {
   let message: { id: string } | null = null
 
   try {
     const apiKey = req.apiKey
-
     if (!apiKey) {
       return res.status(401).json({ error: 'Invalid API key' })
     }
 
+    const userId = apiKey.user_id
     const { to_email, subject, html, variables, from_email } = req.body
 
-    console.log('API KEY USER ID:', apiKey.user_id)
-    console.log('VARIABLES:', variables)
-
     if (!to_email || !subject || !html) {
-      return res.status(400).json({
-        error: 'Missing required fields',
-      })
+      return res.status(400).json({ error: 'Missing required fields: to_email, subject, html' })
     }
 
-    // 1. INSERT MESSAGE (ANTES de enviar)
+    // 1. INSERT message (status = pending before send)
+    const msgPayload: Record<string, unknown> = {
+      user_id:    userId,
+      api_key_id: apiKey.id,
+      to_email,
+      from_email: from_email || process.env.AWS_SES_FROM_EMAIL || 'notificaciones@mail-sendix.com',
+      subject,
+      html,
+      status:     'pending',
+    }
+    if (apiKey.organization_id) {
+      msgPayload.organization_id = apiKey.organization_id
+    }
+
     const { data: msgData, error: insertError } = await supabaseAdmin
       .from('messages')
-      .insert({
-        user_id: apiKey.user_id,
-        api_key_id: apiKey.id,
-        to_email: to_email,
-        from_email: from_email || 'onboarding@resend.dev',
-        subject,
-        html,
-        status: 'pending',
-      })
+      .insert(msgPayload)
       .select()
       .single()
 
-    if (insertError) {
+    if (insertError || !msgData) {
       console.error('INSERT ERROR:', insertError)
-      return res.status(500).json({
-        error: 'Failed to create message',
-      })
-    }
-
-    if (!msgData) {
-      return res.status(500).json({
-        error: 'Failed to create message',
-      })
+      return res.status(500).json({ error: 'Failed to create message record' })
     }
 
     message = msgData as { id: string }
-    console.log('MESSAGE CREATED:', message.id)
 
-    // Apply variables to HTML
-    const finalHtml = applyVariables(html, variables)
+    // 2. Apply variables and send
+    const finalHtml = applyVariables(html, variables || {})
 
-    // 2. SEND EMAIL
-    const result = await sendEmail({
-      to: to_email,
-      from: from_email || undefined,
-      subject,
-      html: finalHtml,
-    })
-
-    console.log('SEND RESPONSE:', result)
+    const result = await sendEmail(
+      { to: to_email, from: from_email || undefined, subject, html: finalHtml },
+      userId
+    )
 
     if (!result.success) {
       throw new Error(result.error ?? 'Email send failed')
     }
 
-    console.log('EMAIL SENT:', result.messageId)
-
-    // 3. UPDATE MESSAGE → sent
+    // 3. Update message → sent
     await supabaseAdmin
       .from('messages')
       .update({ status: 'sent' })
       .eq('id', message.id)
 
-    // 4. INSERT LOG
+    // 4. Increment monthly counter (non-blocking — failure doesn't affect response)
+    incrementEmailCounter(userId, 1).catch(() => {/* already logged inside */})
+
+    // 5. Insert send log
     const provider = (process.env.EMAIL_PROVIDER ?? 'resend').toLowerCase()
-    const { error: logError } = await supabaseAdmin
-      .from('logs')
-      .insert({
-        message_id: message.id,
-        status: 'sent',
-        provider,
-      })
-
-    if (logError) {
-      console.error('LOG INSERT ERROR:', logError)
-    } else {
-      console.log('LOG INSERTED SUCCESSFULLY')
-    }
-
-    return res.json({
-      success: true,
-      messageId: message.id,
+    await supabaseAdmin.from('logs').insert({
+      message_id: message.id,
+      status:     'sent',
+      provider,
     })
+
+    return res.json({ success: true, messageId: message.id })
 
   } catch (err: unknown) {
     const catchError = err as { message?: string }
-    console.error('UNEXPECTED ERROR:', catchError)
+    console.error('SEND ERROR:', catchError)
 
-    // 5. UPDATE MESSAGE → failed (if message was created)
+    // Update message → failed
     if (message?.id) {
       await supabaseAdmin
         .from('messages')
         .update({ status: 'failed' })
         .eq('id', message.id)
 
-      // 6. INSERT FAIL LOG
-      const { error: failLogError } = await supabaseAdmin
-        .from('logs')
-        .insert({
-          message_id: message.id,
-          status: 'failed',
-          error: catchError.message,
-        })
-
-      if (failLogError) {
-        console.error('FAIL LOG INSERT ERROR:', failLogError)
-      }
+      await supabaseAdmin.from('logs').insert({
+        message_id: message.id,
+        status:     'failed',
+        error:      catchError.message,
+      })
     }
 
-    return res.status(500).json({
-      error: 'Internal server error',
-    })
+    return res.status(500).json({ error: 'Internal server error' })
   }
 })
 
-// Bulk send endpoint
-router.post('/bulk', authApiKey, async (req: AuthenticatedRequest, res: Response) => {
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/send/bulk
+// Bulk email send — one template, many recipients
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/bulk', authApiKey, checkEmailLimit, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const apiKey = req.apiKey
     if (!apiKey) {
       return res.status(401).json({ error: 'Invalid API key' })
     }
 
+    const userId = apiKey.user_id
     const { rows, subject, from_email, template } = req.body
 
     if (!rows || !Array.isArray(rows)) {
       return res.status(400).json({ error: 'rows array required' })
     }
-
     if (!template) {
       return res.status(400).json({ error: 'template required' })
     }
 
-    console.log('Bulk sending to', rows.length, 'recipients')
-
     const BATCH_SIZE = 5
-const DELAY_MS = 1000
-
-    const results = []
+    const DELAY_MS   = 1000
+    const results    = []
 
     for (let i = 0; i < rows.length; i += BATCH_SIZE) {
       const batch = rows.slice(i, i + BATCH_SIZE)
 
-      console.log(`Processing batch ${i / BATCH_SIZE + 1}`)
-
       const batchResults = await Promise.all(
-        batch.map(async (row) => {
+        batch.map(async (row: Record<string, string>) => {
           try {
             let html = template
-
             Object.keys(row).forEach((key) => {
               html = html.replace(new RegExp(`{{${key}}}`, 'g'), row[key])
             })
 
-            const response = await sendEmail({
-              to: row.email || row.Email || row.mail,
-              subject,
-              html,
-              from: from_email,
-            })
-
+            const response = await sendEmail(
+              { to: row.email || row.Email || row.mail, subject, html, from: from_email },
+              userId
+            )
             return { success: response.success, error: response.error || null }
-          } catch (error: any) {
-            return { success: false, error: error.message }
+          } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : 'Unknown error'
+            return { success: false, error: message }
           }
         })
       )
@@ -208,16 +174,23 @@ const DELAY_MS = 1000
       }
     }
 
-    res.json({
+    const sentCount = results.filter(r => r.success).length
+
+    // Increment counter by the number of successfully sent emails
+    if (sentCount > 0) {
+      incrementEmailCounter(userId, sentCount).catch(() => {/* logged inside */})
+    }
+
+    return res.json({
       success: true,
-      total: rows.length,
-      sent: results.filter(r => r.success).length,
-      failed: results.filter(r => !r.success).length,
+      total:   rows.length,
+      sent:    sentCount,
+      failed:  results.filter(r => !r.success).length,
       results,
     })
   } catch (err) {
     console.error('Bulk send error:', err)
-    res.status(500).json({ error: 'Bulk send failed' })
+    return res.status(500).json({ error: 'Bulk send failed' })
   }
 })
 

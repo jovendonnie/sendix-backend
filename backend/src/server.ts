@@ -3,6 +3,7 @@ import cors from 'cors'
 import 'dotenv/config'
 import apiRoutes from './routes/index'
 import v1Routes from './routes/v1'
+import { startMonthlyCron } from './lib/cron'
 
 const app = express()
 const port = process.env.PORT || 3001
@@ -62,4 +63,9 @@ app.use((req, res) => {
 // Start server
 app.listen(port, () => {
   console.log(`🚀 Backend running at http://localhost:${port}`)
+
+  // Start the monthly email counter reset cron
+  // NOTE: If you're using Supabase pg_cron instead (recommended for production),
+  //       comment out this line and set up the cron.schedule() SQL in Supabase.
+  startMonthlyCron()
 })

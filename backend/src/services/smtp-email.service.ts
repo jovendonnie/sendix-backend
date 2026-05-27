@@ -1,6 +1,7 @@
 import { getSmtpTransporter } from '../lib/smtp'
+import { supabaseAdmin } from '../lib/supabaseAdmin'
 
-// ─── Shared interface (also used by resend-email.service.ts) ──────────────────
+// ─── Shared interfaces ────────────────────────────────────────────────────────
 
 export interface EmailPayload {
   to: string | string[]
@@ -8,6 +9,7 @@ export interface EmailPayload {
   subject: string
   html?: string
   text?: string
+  replyTo?: string
   attachments?: Array<{
     filename: string
     content: string | Buffer
@@ -21,36 +23,33 @@ export interface EmailSendResult {
   error?: string
 }
 
-// ─── DKIM config (optional — only when private key is set) ───────────────────
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-function buildDkimConfig() {
-  const privateKey = process.env.SMTP_DKIM_PRIVATE_KEY
-  const domainName = process.env.SMTP_DKIM_DOMAIN
-  const keySelector = process.env.SMTP_DKIM_SELECTOR ?? 'sendix'
+const FREE_FROM_EMAIL = process.env.AWS_SES_FROM_EMAIL || 'notificaciones@mail-sendix.com'
+const FREE_FROM_NAME  = process.env.SMTP_FROM_NAME      || 'SendIX'
 
-  if (!privateKey || !domainName) return undefined
+// ─── Identity resolver ───────────────────────────────────────────────────────
 
-  // The private key in env vars often has literal \n — convert to real newlines
-  const normalizedKey = privateKey.replace(/\\n/g, '\n')
+/**
+ * Look up the first SES-verified domain for the user.
+ * Returns null if the user is on the Free plan (no verified domain).
+ */
+async function getVerifiedDomain(userId: string): Promise<{ id: string; domain: string } | null> {
+  const { data, error } = await supabaseAdmin
+    .from('domains')
+    .select('id, domain')
+    .eq('user_id', userId)
+    .eq('ses_verification_status', 'verified')
+    .limit(1)
+    .maybeSingle()
 
-  return {
-    domainName,
-    keySelector,
-    privateKey: normalizedKey,
-  }
+  if (error || !data) return null
+  return data
 }
 
-// ─── Default sender ───────────────────────────────────────────────────────────
+// ─── Retry helper ────────────────────────────────────────────────────────────
 
-function defaultFrom(): string {
-  const domain = process.env.SMTP_FROM_DOMAIN ?? 'sendix.com'
-  const name = process.env.SMTP_FROM_NAME ?? 'SendIX'
-  return `${name} <noreply@${domain}>`
-}
-
-// ─── Send with automatic retry ───────────────────────────────────────────────
-
-const MAX_RETRIES = 3
+const MAX_RETRIES   = 2
 const RETRY_DELAY_MS = 500
 
 async function withRetry<T>(fn: () => Promise<T>, retries = MAX_RETRIES): Promise<T> {
@@ -63,32 +62,83 @@ async function withRetry<T>(fn: () => Promise<T>, retries = MAX_RETRIES): Promis
   }
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+// ─── Public send function ────────────────────────────────────────────────────
 
-export async function sendEmailViaSmtp(payload: EmailPayload): Promise<EmailSendResult> {
+/**
+ * Dispatcher that routes each send to the correct identity:
+ *
+ *  Free  → from = SendIX shared domain, replyTo = client's original from
+ *  Pro   → from = payload.from (must match verified domain), SES signs via Easy DKIM
+ *
+ * @param payload  Email payload from the route handler
+ * @param userId   Supabase user ID (used to look up verified domains). Optional for internal use.
+ */
+export async function sendEmailViaSmtp(
+  payload: EmailPayload,
+  userId?: string
+): Promise<EmailSendResult> {
   const { to, from, subject, html, text, attachments } = payload
 
   try {
-    const transporter = getSmtpTransporter()
-    const dkim = buildDkimConfig()
+    let resolvedFrom: string
+    let resolvedReplyTo: string | undefined = payload.replyTo
+    let cacheKey = 'shared'
+
+    if (userId) {
+      const verifiedDomain = await getVerifiedDomain(userId)
+
+      if (verifiedDomain) {
+        // ── Pro / Agency ──────────────────────────────────────────────────────
+        // The From: must belong to the verified domain; SES handles DKIM signing.
+        if (from) {
+          // Extract domain portion (handles "Name <user@domain.com>" and "user@domain.com")
+          const match = from.match(/@([\w.-]+)/)
+          const fromDomain = match ? match[1].toLowerCase() : null
+
+          if (!fromDomain || fromDomain !== verifiedDomain.domain) {
+            return {
+              success: false,
+              error: `El remitente '${from}' no pertenece a tu dominio verificado (${verifiedDomain.domain})`
+            }
+          }
+          resolvedFrom = from
+        } else {
+          resolvedFrom = `${FREE_FROM_NAME} <noreply@${verifiedDomain.domain}>`
+        }
+        cacheKey = verifiedDomain.domain
+
+      } else {
+        // ── Free plan ─────────────────────────────────────────────────────────
+        // Override From: with SendIX shared domain.
+        // Move the client's original from to Reply-To so replies go to the client.
+        resolvedFrom    = `${FREE_FROM_NAME} <${FREE_FROM_EMAIL}>`
+        resolvedReplyTo = from || resolvedReplyTo
+        cacheKey        = 'shared'
+      }
+    } else {
+      // No userId (internal / transactional): use free sender as-is
+      resolvedFrom = from || `${FREE_FROM_NAME} <${FREE_FROM_EMAIL}>`
+    }
+
+    const transporter = getSmtpTransporter(cacheKey)
 
     const info = await withRetry(() =>
       transporter.sendMail({
-        from: from || defaultFrom(),
-        to: Array.isArray(to) ? to.join(', ') : to,
+        from:    resolvedFrom,
+        to:      Array.isArray(to) ? to.join(', ') : to,
         subject,
-        html: html || undefined,
-        text: text || undefined,
+        html:    html    || undefined,
+        text:    text    || undefined,
+        replyTo: resolvedReplyTo,
         attachments: attachments?.map(a => ({
-          filename: a.filename,
-          content: a.content,
+          filename:    a.filename,
+          content:     a.content,
           contentType: a.contentType,
         })),
-        ...(dkim ? { dkim } : {}),
       })
     )
 
-    console.log(`[smtp] Sent — messageId: ${info.messageId}`)
+    console.log(`[smtp] Sent — messageId: ${info.messageId} | from: ${resolvedFrom}`)
     return { success: true, messageId: info.messageId }
 
   } catch (err: unknown) {
@@ -101,7 +151,7 @@ export async function sendEmailViaSmtp(payload: EmailPayload): Promise<EmailSend
 /** Verify SMTP connection — use on startup or health-check endpoint. */
 export async function verifySmtpConnection(): Promise<boolean> {
   try {
-    const transporter = getSmtpTransporter()
+    const transporter = getSmtpTransporter('shared')
     await transporter.verify()
     console.log('[smtp] Connection verified')
     return true

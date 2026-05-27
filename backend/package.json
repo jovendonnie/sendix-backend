@@ -9,6 +9,7 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
+    "@aws-sdk/client-ses": "^3.1054.0",
     "@supabase/supabase-js": "^2.103.3",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.5",

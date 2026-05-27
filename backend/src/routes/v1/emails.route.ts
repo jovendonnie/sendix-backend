@@ -1,9 +1,12 @@
 import { Router, Response } from 'express'
 import { supabaseAdmin } from '../../lib/supabaseAdmin'
 import { authApiKey, AuthenticatedRequest, checkScope } from '../../middleware/authApiKey'
-import { checkEmailLimit } from '../../middleware/checkPlanLimits'
+import { checkEmailLimit, incrementEmailCounter } from '../../middleware/checkPlanLimits'
 import { sendEmail } from '../../services/email.service'
 import { triggerWebhooks } from '../../services/webhook.service'
+
+const DEFAULT_FROM_EMAIL =
+  process.env.AWS_SES_FROM_EMAIL || 'onboarding@supportsendix.online'
 
 const router = Router()
 
@@ -54,7 +57,9 @@ router.post('/', authApiKey, checkEmailLimit, async (req: AuthenticatedRequest, 
 
     toEmails = Array.isArray(to) ? to : [to]
 
-    const fromEmail = from || undefined
+    // Always resolve a fallback so from_email is never null in the DB.
+    // The SMTP dispatcher will override this to the shared SendIX domain for Free plans.
+    const fromEmail = (from && from.trim()) ? from.trim() : DEFAULT_FROM_EMAIL
 
     let finalHtml = html || ''
     if (variables && typeof variables === 'object') {
@@ -68,17 +73,22 @@ router.post('/', authApiKey, checkEmailLimit, async (req: AuthenticatedRequest, 
       finalHtml = `<p>${text}</p>`
     }
 
+    const messagePayload: Record<string, unknown> = {
+      user_id: apiKey.user_id,
+      api_key_id: apiKey.id,
+      to_email: toEmails.join(', '),
+      from_email: fromEmail,
+      subject,
+      html: finalHtml,
+      status: 'pending',
+    }
+    if (apiKey.organization_id) {
+      messagePayload.organization_id = apiKey.organization_id
+    }
+
     const { data: msgData, error: insertError } = await supabaseAdmin
       .from('messages')
-      .insert({
-        user_id: apiKey.user_id,
-        api_key_id: apiKey.id,
-        to_email: toEmails.join(', '),
-        from_email: fromEmail,
-        subject,
-        html: finalHtml,
-        status: 'pending',
-      })
+      .insert(messagePayload)
       .select()
       .single()
 
@@ -93,12 +103,15 @@ router.post('/', authApiKey, checkEmailLimit, async (req: AuthenticatedRequest, 
 
     message = msgData as { id: string }
 
-    const result = await sendEmail({
-      to: toEmails.length === 1 ? toEmails[0] : toEmails,
-      from: fromEmail,
-      subject,
-      html: finalHtml,
-    })
+    const result = await sendEmail(
+      {
+        to: toEmails.length === 1 ? toEmails[0] : toEmails,
+        from: fromEmail,
+        subject,
+        html: finalHtml,
+      },
+      apiKey.user_id  // required for SES identity routing (Free vs Pro)
+    )
 
     if (!result.success) {
       throw new Error(result.error ?? 'Email send failed')
@@ -108,6 +121,9 @@ router.post('/', authApiKey, checkEmailLimit, async (req: AuthenticatedRequest, 
       .from('messages')
       .update({ status: 'sent' })
       .eq('id', message.id)
+
+    // Increment monthly counter (non-blocking)
+    incrementEmailCounter(apiKey.user_id, 1).catch(() => {/* logged inside */})
 
     const provider = (process.env.EMAIL_PROVIDER ?? 'resend').toLowerCase()
     await supabaseAdmin
@@ -222,12 +238,15 @@ router.post('/batch', authApiKey, checkEmailLimit, async (req: AuthenticatedRequ
               })
             }
 
-            const result = await sendEmail({
-              to,
-              from: from || undefined,
-              subject,
-              html: finalHtml,
-            })
+            const result = await sendEmail(
+              {
+                to,
+                from: (from && from.trim()) ? from.trim() : DEFAULT_FROM_EMAIL,
+                subject,
+                html: finalHtml,
+              },
+              apiKey.user_id
+            )
 
             return { success: result.success, error: result.error || null, email: to }
           } catch (error: any) {

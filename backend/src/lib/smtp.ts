@@ -1,29 +1,38 @@
 import nodemailer, { Transporter } from 'nodemailer'
 
-let _transporter: Transporter | null = null
-
 /**
- * Returns the singleton SMTP transporter.
- * The pool is created once and reused across requests.
- * Throws at call time (not at import time) so missing env vars surface as
- * runtime errors with a clear message rather than silent undefined behaviour.
+ * Per-domain cache of Nodemailer transporters.
+ *
+ * Key strategy:
+ *  - 'shared'        → Plan Free / fallback (uses SendIX shared domain)
+ *  - 'empresa.com'   → Plan Pro/Agency (key = verified customer domain)
+ *
+ * With Easy DKIM, all transporters connect to the same SES SMTP endpoint
+ * with the same credentials — the difference lives only in the From: header.
+ * SES signs automatically when it detects a verified Easy-DKIM domain.
  */
-export function getSmtpTransporter(): Transporter {
-  if (_transporter) return _transporter
+const transporterCache = new Map<string, Transporter>()
 
-  const host = process.env.SMTP_HOST
-  const port = parseInt(process.env.SMTP_PORT ?? '587', 10)
-  const user = process.env.SMTP_USER
-  const pass = process.env.SMTP_PASS
-  const secure = process.env.SMTP_SECURE === 'true' // true = port 465 implicit TLS
+export function getSmtpTransporter(domainKey: string = 'shared'): Transporter {
+  if (transporterCache.has(domainKey)) {
+    return transporterCache.get(domainKey)!
+  }
+
+  const host = process.env.AWS_SES_SMTP_HOST || process.env.SMTP_HOST
+  const port = parseInt(process.env.AWS_SES_SMTP_PORT || process.env.SMTP_PORT || '465', 10)
+  const user = process.env.AWS_SES_SMTP_USER || process.env.SMTP_USER
+  const pass = process.env.AWS_SES_SMTP_PASS || process.env.SMTP_PASS
+  // port 465 = implicit TLS (secure: true)
+  // port 587 = STARTTLS — starts plain then upgrades (secure: false)
+  const secure = port === 465
 
   if (!host || !user || !pass) {
     throw new Error(
-      'SMTP not configured. Set SMTP_HOST, SMTP_USER and SMTP_PASS in the backend .env file.'
+      'SMTP not configured. Set AWS_SES_SMTP_HOST, AWS_SES_SMTP_USER and AWS_SES_SMTP_PASS in the backend .env file.'
     )
   }
 
-  _transporter = nodemailer.createTransport({
+  const transporter = nodemailer.createTransport({
     host,
     port,
     secure,
@@ -34,18 +43,39 @@ export function getSmtpTransporter(): Transporter {
     rateDelta: 1000,     // rate-limit window (ms)
     rateLimit: 10,       // max messages per rateDelta window
     tls: {
-      // Accept self-signed certs in dev; in prod, your SMTP relay's cert will be valid
       rejectUnauthorized: process.env.NODE_ENV === 'production',
     },
   })
 
-  return _transporter
+  transporterCache.set(domainKey, transporter)
+  console.log(`[smtp] Transporter created and cached for key: "${domainKey}"`)
+  return transporter
 }
 
-/** Call this if you need to force-reset the singleton (e.g. during tests). */
-export function resetSmtpTransporter(): void {
-  if (_transporter) {
-    (_transporter as Transporter & { close?: () => void }).close?.()
-    _transporter = null
+/**
+ * Clear a specific transporter from the cache.
+ * Call this when a customer's domain is revoked so the next send
+ * doesn't accidentally reuse a stale connection.
+ */
+export function clearTransporterCache(domainKey: string): void {
+  const transporter = transporterCache.get(domainKey)
+  if (transporter) {
+    ;(transporter as Transporter & { close?: () => void }).close?.()
+    transporterCache.delete(domainKey)
+    console.log(`[smtp] Cleared transporter cache for: "${domainKey}"`)
   }
 }
+
+/**
+ * Reset all cached transporters (useful in tests or forced restarts).
+ */
+export function resetAllTransporters(): void {
+  for (const transporter of transporterCache.values()) {
+    ;(transporter as Transporter & { close?: () => void }).close?.()
+  }
+  transporterCache.clear()
+  console.log('[smtp] All transporter caches cleared')
+}
+
+/** @deprecated Use resetAllTransporters() */
+export const resetSmtpTransporter = resetAllTransporters

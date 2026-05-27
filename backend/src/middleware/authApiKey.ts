@@ -8,6 +8,7 @@ export interface AuthenticatedRequest extends Request {
     user_id: string
     name: string
     scope?: string
+    organization_id?: string | null
   }
 }
 
@@ -39,7 +40,7 @@ export async function authApiKey(
 
     const { data: keys, error } = await supabaseAdmin
       .from('api_keys')
-      .select('id, user_id, name, key_hash, scope')
+      .select('id, user_id, name, key_hash, scope, organization_id')
       .eq('revoked', false)
 
     if (error) {
@@ -73,7 +74,8 @@ export async function authApiKey(
                id: key.id,
                user_id: key.user_id,
                name: key.name,
-               scope: key.scope || 'full_access'
+               scope: key.scope || 'full_access',
+               organization_id: (key as any).organization_id ?? null,
              }
              next()
              return
