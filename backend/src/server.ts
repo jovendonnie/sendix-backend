@@ -3,6 +3,7 @@ import cors from 'cors'
 import 'dotenv/config'
 import apiRoutes from './routes/index'
 import v1Routes from './routes/v1'
+import unsubscribeRouter from './routes/unsubscribe.route'
 import { startMonthlyCron } from './lib/cron'
 
 const app = express()
@@ -21,10 +22,15 @@ app.use(cors({
   credentials: true
 }))
 
-// Conditional body parsing: raw for Stripe webhook, JSON for everything else
+// Conditional body parsing
+// - Stripe webhook: raw buffer (needs signature verification against raw bytes)
+// - SNS webhook:    text (SNS sends JSON with Content-Type: text/plain, not application/json)
+// - Everything else: JSON
 app.use((req, res, next) => {
   if (req.path === '/api/billing/webhook') {
     express.raw({ type: 'application/json' })(req, res, next)
+  } else if (req.path === '/api/webhooks/ses') {
+    express.text({ type: '*/*' })(req, res, next)
   } else {
     express.json()(req, res, next)
   }
@@ -40,6 +46,9 @@ app.get('/', (req, res) => {
 app.get('/test', (req, res) => {
   res.json({ ok: true })
 })
+
+// Unsubscribe — public, no auth, must be before /api to avoid conflicts
+app.use('/unsubscribe', unsubscribeRouter)
 
 // API Routes (prefixed with /api)
 app.use('/api', apiRoutes)

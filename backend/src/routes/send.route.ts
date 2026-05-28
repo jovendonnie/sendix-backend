@@ -3,6 +3,8 @@ import { supabaseAdmin } from '../lib/supabaseAdmin'
 import { authApiKey, AuthenticatedRequest } from '../middleware/authApiKey'
 import { checkEmailLimit, incrementEmailCounter } from '../middleware/checkPlanLimits'
 import { sendEmail } from '../services/email.service'
+import { filterSuppressedEmails } from '../services/suppression.service'
+import { generateUnsubscribeToken, buildUnsubscribeUrl, injectUnsubscribeFooter } from '../services/unsubscribe.service'
 
 const router = Router()
 
@@ -75,13 +77,32 @@ router.post('/', authApiKey, checkEmailLimit, async (req: AuthenticatedRequest, 
     )
 
     if (!result.success) {
+      if (result.suppressed) {
+        // Email was suppressed — mark message accordingly and return success (not an error)
+        await supabaseAdmin
+          .from('messages')
+          .update({ status: 'suppressed' })
+          .eq('id', message.id)
+
+        const provider = (process.env.EMAIL_PROVIDER ?? 'resend').toLowerCase()
+        await supabaseAdmin.from('logs').insert({
+          message_id: message.id,
+          status:     'suppressed',
+          error:      `Suppressed: ${result.suppressedReason}`,
+          provider,
+        })
+
+        return res.json({ success: true, messageId: message.id, suppressed: true, reason: result.suppressedReason })
+      }
       throw new Error(result.error ?? 'Email send failed')
     }
 
-    // 3. Update message → sent
+    // 3. Update message → sent + store SES message ID for delivery/bounce tracking
+    // nodemailer wraps the ID in angle brackets; strip them so it matches SNS notifications
+    const sesMessageId = result.messageId?.replace(/^<|>$/g, '') ?? null
     await supabaseAdmin
       .from('messages')
-      .update({ status: 'sent' })
+      .update({ status: 'sent', ses_message_id: sesMessageId })
       .eq('id', message.id)
 
     // 4. Increment monthly counter (non-blocking — failure doesn't affect response)
@@ -144,19 +165,40 @@ router.post('/bulk', authApiKey, checkEmailLimit, async (req: AuthenticatedReque
     const DELAY_MS   = 1000
     const results    = []
 
+    // Pre-filter suppressed emails for the entire batch in one query
+    const allEmails = rows.map((r: Record<string, string>) => r.email || r.Email || r.mail).filter(Boolean)
+    const { suppressed: suppressedEmails } = await filterSuppressedEmails(allEmails, userId)
+    const suppressedSet = new Set(suppressedEmails.map(s => s.email.toLowerCase()))
+
     for (let i = 0; i < rows.length; i += BATCH_SIZE) {
       const batch = rows.slice(i, i + BATCH_SIZE)
 
       const batchResults = await Promise.all(
         batch.map(async (row: Record<string, string>) => {
+          const recipientEmail = (row.email || row.Email || row.mail || '').toLowerCase()
+
+          if (suppressedSet.has(recipientEmail)) {
+            return { success: true, suppressed: true, email: recipientEmail }
+          }
+
           try {
             let html = template
             Object.keys(row).forEach((key) => {
               html = html.replace(new RegExp(`{{${key}}}`, 'g'), row[key])
             })
 
+            // Generate unsubscribe token and inject footer for bulk sends
+            let unsubscribeUrl: string | undefined
+            try {
+              const token = await generateUnsubscribeToken(recipientEmail, userId)
+              unsubscribeUrl = buildUnsubscribeUrl(token)
+              html = injectUnsubscribeFooter(html, unsubscribeUrl)
+            } catch (tokenErr) {
+              console.warn('[bulk] Failed to generate unsubscribe token:', tokenErr)
+            }
+
             const response = await sendEmail(
-              { to: row.email || row.Email || row.mail, subject, html, from: from_email },
+              { to: recipientEmail, subject, html, from: from_email, unsubscribeUrl },
               userId
             )
             return { success: response.success, error: response.error || null }
@@ -174,18 +216,20 @@ router.post('/bulk', authApiKey, checkEmailLimit, async (req: AuthenticatedReque
       }
     }
 
-    const sentCount = results.filter(r => r.success).length
+    const sentCount       = results.filter(r => r.success && !r.suppressed).length
+    const suppressedCount = results.filter(r => r.suppressed).length
 
-    // Increment counter by the number of successfully sent emails
+    // Only increment counter for actually sent emails (not suppressed)
     if (sentCount > 0) {
       incrementEmailCounter(userId, sentCount).catch(() => {/* logged inside */})
     }
 
     return res.json({
-      success: true,
-      total:   rows.length,
-      sent:    sentCount,
-      failed:  results.filter(r => !r.success).length,
+      success:    true,
+      total:      rows.length,
+      sent:       sentCount,
+      suppressed: suppressedCount,
+      failed:     results.filter(r => !r.success && !r.suppressed).length,
       results,
     })
   } catch (err) {

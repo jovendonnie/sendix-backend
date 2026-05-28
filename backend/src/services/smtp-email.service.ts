@@ -1,5 +1,6 @@
 import { getSmtpTransporter } from '../lib/smtp'
 import { supabaseAdmin } from '../lib/supabaseAdmin'
+import { isEmailSuppressed } from './suppression.service'
 
 // ─── Shared interfaces ────────────────────────────────────────────────────────
 
@@ -10,6 +11,8 @@ export interface EmailPayload {
   html?: string
   text?: string
   replyTo?: string
+  /** If provided, adds List-Unsubscribe headers (bulk sends only) */
+  unsubscribeUrl?: string
   attachments?: Array<{
     filename: string
     content: string | Buffer
@@ -21,6 +24,8 @@ export interface EmailSendResult {
   success: boolean
   messageId?: string
   error?: string
+  suppressed?: boolean
+  suppressedReason?: string
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -77,7 +82,17 @@ export async function sendEmailViaSmtp(
   payload: EmailPayload,
   userId?: string
 ): Promise<EmailSendResult> {
-  const { to, from, subject, html, text, attachments } = payload
+  const { to, from, subject, html, text, attachments, unsubscribeUrl } = payload
+
+  // ── Suppression check (single recipient only) ─────────────────────────────
+  // Bulk sends are pre-filtered in the route handler; this covers individual sends.
+  if (userId && !Array.isArray(to)) {
+    const check = await isEmailSuppressed(to, userId)
+    if (check.suppressed) {
+      console.log(`[smtp] Suppressed — skipping ${to} (reason: ${check.reason})`)
+      return { success: false, suppressed: true, suppressedReason: check.reason }
+    }
+  }
 
   try {
     let resolvedFrom: string
@@ -135,6 +150,10 @@ export async function sendEmailViaSmtp(
           content:     a.content,
           contentType: a.contentType,
         })),
+        headers: unsubscribeUrl ? {
+          'List-Unsubscribe':      `<${unsubscribeUrl}>`,
+          'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+        } : undefined,
       })
     )
 
