@@ -883,7 +883,7 @@ Las imágenes en GHCR son **privadas por defecto**. El Droplet necesita un Perso
 **Autenticar en el Droplet** (reemplaza `ghp_TUTOKEN` con el token copiado):
 
 ```bash
-echo "ghp_TUTOKEN" | docker login ghcr.io -u jovendonnie --password-stdin
+echo "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" | docker login ghcr.io -u jovendonnie --password-stdin
 # Resultado esperado: Login Succeeded
 ```
 
@@ -892,8 +892,8 @@ echo "ghp_TUTOKEN" | docker login ghcr.io -u jovendonnie --password-stdin
 ```bash
 cd /opt/sendix
 
-docker pull ghcr.io/<jovendonnie>/sendix-frontend:latest
-docker pull ghcr.io/<jovendonnie>/sendix-backend:latest
+docker pull ghcr.io/jovendonnie/sendix-frontend:latest
+docker pull ghcr.io/jovendonnie/sendix-backend:latest
 ```
 
 > Si las imágenes aún no existen, haz un push al branch `main` de cada repo para que los workflows de GitHub Actions las construyan y suban a GHCR primero.
@@ -1028,7 +1028,7 @@ docker compose -f docker-compose.prod.yml up -d
 ```bash
 cd /opt/sendix
 
-docker pull ghcr.io/<usuario>/sendix-backend:latest
+docker pull ghcr.io/jovendonnie/sendix-backend:latest
 docker compose -f docker-compose.prod.yml up -d --no-deps --force-recreate backend
 docker image prune -f
 ```
