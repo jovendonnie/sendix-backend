@@ -642,6 +642,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/sendix-frontend
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-and-push:
@@ -659,7 +660,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v3.4.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -667,7 +668,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v5.7.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -675,10 +676,10 @@ jobs:
             type=sha,prefix=sha-
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v3.10.0
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6.16.0
         with:
           context: ./frontend
           file: ./frontend/Dockerfile
@@ -703,7 +704,7 @@ jobs:
 
     steps:
       - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@v1.2.2
         with:
           host: ${{ secrets.DROPLET_HOST }}
           username: ${{ secrets.DROPLET_USER }}
@@ -786,6 +787,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/sendix-backend
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-and-push:
@@ -800,7 +802,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v3.4.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -808,7 +810,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v5.7.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -816,10 +818,10 @@ jobs:
             type=sha,prefix=sha-
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v3.10.0
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6.16.0
         with:
           context: ./backend
           file: ./backend/Dockerfile
@@ -867,12 +869,22 @@ Una vez que todo está configurado, sigue estos pasos por primera vez:
 
 ### 11.1 Autenticar Docker en GHCR desde el Droplet
 
-```bash
-# En el Droplet como usuario deploy
-# Genera un Personal Access Token en GitHub con scope: read:packages
-# GitHub → Settings → Developer Settings → Personal Access Tokens → Classic
+Las imágenes en GHCR son **privadas por defecto**. El Droplet necesita un Personal Access Token (PAT) para poder hacer `docker pull`.
 
-echo "ghp_TU_TOKEN_GITHUB" | docker login ghcr.io -u jovendonnie --password-stdin
+**Crear el PAT en GitHub:**
+1. GitHub → tu avatar → **Settings**
+2. Baja hasta **Developer settings** → **Personal access tokens** → **Tokens (classic)**
+3. Clic en **Generate new token (classic)**
+4. Nombre: `droplet-ghcr-read`
+5. Expiration: `No expiration`
+6. Marca el scope: ✅ `read:packages`
+7. Clic en **Generate token** y copia el valor (`ghp_xxxx...`)
+
+**Autenticar en el Droplet** (reemplaza `ghp_TUTOKEN` con el token copiado):
+
+```bash
+echo "ghp_TUTOKEN" | docker login ghcr.io -u jovendonnie --password-stdin
+# Resultado esperado: Login Succeeded
 ```
 
 ### 11.2 Pull de las imágenes iniciales
@@ -880,8 +892,8 @@ echo "ghp_TU_TOKEN_GITHUB" | docker login ghcr.io -u jovendonnie --password-stdi
 ```bash
 cd /opt/sendix
 
-docker pull ghcr.io/<tu-usuario>/sendix-frontend:latest
-docker pull ghcr.io/<tu-usuario>/sendix-backend:latest
+docker pull ghcr.io/<jovendonnie>/sendix-frontend:latest
+docker pull ghcr.io/<jovendonnie>/sendix-backend:latest
 ```
 
 > Si las imágenes aún no existen, haz un push al branch `main` de cada repo para que los workflows de GitHub Actions las construyan y suban a GHCR primero.
