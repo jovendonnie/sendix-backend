@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express'
 import { db } from '../lib/db'
 import { AuthenticatedRequest } from './authApiKey'
+import { UserRequest } from './authSupabaseUser'
 
 const PLAN_EMAIL_LIMITS: Record<string, number> = {
   free:   3_000,
@@ -76,12 +77,12 @@ export async function checkEmailLimit(
 }
 
 export async function checkApiKeyLimit(
-  req: Request,
+  req: UserRequest,
   res: Response,
   next: NextFunction
 ): Promise<void> {
   try {
-    const userId = req.headers['x-user-id'] as string
+    const userId = req.userId
     if (!userId) { next(); return }
 
     const { rows: profileRows } = await db.query(

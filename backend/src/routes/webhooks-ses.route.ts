@@ -6,8 +6,11 @@ import { supabaseAdmin } from '../lib/supabaseAdmin'
 
 const router = Router()
 
-// Simple in-memory cert cache to avoid re-downloading on every request
-const certCache = new Map<string, string>()
+// In-memory cert cache — bounded to 20 URLs with a 1-hour TTL to prevent unbounded growth
+const CERT_CACHE_TTL = 60 * 60 * 1000
+const CERT_CACHE_MAX = 20
+interface CachedCert { pem: string; expiresAt: number }
+const certCache = new Map<string, CachedCert>()
 
 function fetchUrl(url: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -33,10 +36,15 @@ async function verifySNSSignature(payload: Record<string, string>): Promise<bool
       return false
     }
 
-    let cert = certCache.get(certUrl)
-    if (!cert) {
+    const now = Date.now()
+    const cached = certCache.get(certUrl)
+    let cert: string
+    if (cached && cached.expiresAt > now) {
+      cert = cached.pem
+    } else {
       cert = await fetchUrl(certUrl)
-      certCache.set(certUrl, cert)
+      if (certCache.size >= CERT_CACHE_MAX) certCache.clear()
+      certCache.set(certUrl, { pem: cert, expiresAt: now + CERT_CACHE_TTL })
     }
 
     // Field order is fixed and differs by message type (per AWS docs)

@@ -1,20 +1,13 @@
-import rateLimit, { ipKeyGenerator } from 'express-rate-limit'
-import type { Request } from 'express'
+import rateLimit from 'express-rate-limit'
 
-function getClientIp(req: Request): string {
-  const forwarded = req.headers['x-forwarded-for']
-  const raw = Array.isArray(forwarded)
-    ? forwarded[0]
-    : forwarded?.split(',')[0] ?? req.ip ?? ''
-  return ipKeyGenerator(raw.trim())
-}
+// Uses req.ip which respects the `trust proxy` setting configured in server.ts.
+// Do NOT extract IP from x-forwarded-for manually — it is client-controlled when trust proxy is off.
 
 export const authRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: getClientIp,
   message: {
     error: 'Too many auth requests from this IP. Try again in 15 minutes.',
     code: 'RATE_LIMIT_AUTH',
@@ -27,7 +20,6 @@ export const apiRateLimiter = rateLimit({
   max: 200,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: getClientIp,
   message: {
     error: 'Too many requests from this IP. Try again in 15 minutes.',
     code: 'RATE_LIMIT_API',

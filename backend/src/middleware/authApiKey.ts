@@ -70,14 +70,12 @@ export async function authApiKey(
       [keyPrefix]
     )
 
-    const candidates = (keys && keys.length > 0) ? keys : await _legacyFullScan()
-
-    if (!candidates || candidates.length === 0) {
+    if (!keys || keys.length === 0) {
       res.status(401).json({ error: 'Invalid API key' })
       return
     }
 
-    for (const key of candidates) {
+    for (const key of keys) {
       if (!key.key_hash) continue
 
       const isMatch = await bcrypt.compare(rawKey, key.key_hash)
@@ -113,13 +111,6 @@ export async function authApiKey(
   }
 }
 
-async function _legacyFullScan() {
-  const { rows } = await db.query(
-    'SELECT id, user_id, name, key_hash, scope, organization_id FROM api_keys WHERE revoked = false'
-  )
-  return rows
-}
-
 export function checkScope(
   req: AuthenticatedRequest,
   requiredScope: 'full_access' | 'send_only' | 'read_only'
@@ -133,4 +124,14 @@ export function checkScope(
 
 export function invalidateKeyCache(rawKey: string) {
   keyCache.delete(rawKey)
+}
+
+/** Invalidate a cached key by its database ID (used after revoke/delete when raw key is unavailable). */
+export function invalidateKeyCacheById(keyId: string) {
+  for (const [rawKey, cached] of keyCache) {
+    if (cached.id === keyId) {
+      keyCache.delete(rawKey)
+      break
+    }
+  }
 }

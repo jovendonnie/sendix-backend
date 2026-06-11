@@ -83,8 +83,10 @@ async function revokeApiKey(id: string): Promise<void> {
 }
 
 async function validateApiKey(rawKey: string): Promise<ApiKey | null> {
+  const keyPrefix = rawKey.substring(0, 16)
   const { rows: keys } = await db.query(
-    'SELECT id, user_id, name, last4, revoked, key_hash, created_at, scope FROM api_keys WHERE revoked = false'
+    'SELECT id, user_id, name, last4, revoked, key_hash, created_at, scope FROM api_keys WHERE key_prefix = $1 AND revoked = false',
+    [keyPrefix]
   )
 
   for (const key of keys) {

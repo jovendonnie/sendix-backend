@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express'
 import { stripe, PLANS } from '../lib/stripe'
 import { db } from '../lib/db'
+import { authSupabaseUser, UserRequest } from '../middleware/authSupabaseUser'
 
 const router = Router()
 
@@ -58,12 +59,13 @@ async function syncPlan(customerId: string, plan: string, reason: string) {
   }
 }
 
-router.post('/create-checkout', async (req: Request, res: Response) => {
+router.post('/create-checkout', authSupabaseUser, async (req: UserRequest, res: Response) => {
   try {
-    const { userId, userEmail, plan } = req.body
+    const userId = req.userId!
+    const { userEmail, plan } = req.body
 
-    if (!userId || !userEmail || !plan) {
-      return res.status(400).json({ error: 'Missing required fields: userId, userEmail, plan' })
+    if (!userEmail || !plan) {
+      return res.status(400).json({ error: 'Missing required fields: userEmail, plan' })
     }
 
     if (!PLANS[plan as keyof typeof PLANS]?.priceId) {
@@ -103,13 +105,9 @@ router.post('/create-checkout', async (req: Request, res: Response) => {
   }
 })
 
-router.post('/create-portal', async (req: Request, res: Response) => {
+router.post('/create-portal', authSupabaseUser, async (req: UserRequest, res: Response) => {
   try {
-    const { userId } = req.body
-
-    if (!userId) {
-      return res.status(400).json({ error: 'Missing userId' })
-    }
+    const userId = req.userId!
 
     const { rows } = await db.query(
       'SELECT stripe_customer_id FROM profiles WHERE id = $1',
@@ -207,17 +205,13 @@ router.post('/webhook', async (req: Request, res: Response) => {
   }
 })
 
-router.get('/status', async (req: Request, res: Response) => {
+router.get('/status', authSupabaseUser, async (req: UserRequest, res: Response) => {
   try {
-    const { userId } = req.query
-
-    if (!userId) {
-      return res.status(400).json({ error: 'Missing userId query param' })
-    }
+    const userId = req.userId!
 
     const { rows } = await db.query(
       'SELECT plan, stripe_customer_id FROM profiles WHERE id = $1',
-      [userId as string]
+      [userId]
     )
     const profile = rows[0]
     let plan: string = profile?.plan || 'free'
@@ -234,7 +228,7 @@ router.get('/status', async (req: Request, res: Response) => {
 
         if (trullyActive.length === 0) {
           console.log(`[billing/status] No active subscription for ${userId} — downgrading to free`)
-          await db.query('UPDATE profiles SET plan = $1 WHERE id = $2', ['free', userId as string])
+          await db.query('UPDATE profiles SET plan = $1 WHERE id = $2', ['free', userId])
           plan = 'free'
         }
       } catch (stripeErr: unknown) {

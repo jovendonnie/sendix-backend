@@ -11,6 +11,15 @@ import { apiRateLimiter, authRateLimiter } from './middleware/rateLimiter'
 const app = express()
 const port = process.env.PORT || 3001
 
+// Trust the first proxy (Railway / DigitalOcean load balancer) so that
+// req.ip resolves to the real client IP instead of the proxy's IP.
+// This is required for rate limiting to work correctly behind a reverse proxy.
+app.set('trust proxy', 1)
+
+if (process.env.NODE_ENV === 'production' && !process.env.CORS_ORIGINS) {
+  console.error('[SECURITY] CORS_ORIGINS env var is not set — falling back to localhost in production!')
+}
+
 // Request logging
 app.use((req, res, next) => {
   console.log(`${req.method} ${req.url}`)

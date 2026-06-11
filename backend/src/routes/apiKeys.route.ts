@@ -1,18 +1,21 @@
-import { Router, Request, Response } from 'express'
+import { Router, Response } from 'express'
 import { apiKeyService } from '../services/apiKey.service'
 import { db } from '../lib/db'
 import { checkApiKeyLimit } from '../middleware/checkPlanLimits'
+import { authSupabaseUser, UserRequest } from '../middleware/authSupabaseUser'
+import { invalidateKeyCacheById } from '../middleware/authApiKey'
 
 const router = Router()
 
-router.post('/', checkApiKeyLimit, async (req: Request, res: Response) => {
+// All routes require a valid Supabase JWT.
+// User identity is taken from req.userId (set by authSupabaseUser), never from request headers or body.
+router.use(authSupabaseUser)
+
+router.post('/', checkApiKeyLimit, async (req: UserRequest, res: Response) => {
   try {
-    const user_id = req.headers['x-user-id'] as string
+    const user_id = req.userId!
     const { name, scope } = req.body
 
-    if (!user_id) {
-      return res.status(401).json({ error: 'x-user-id header is required' })
-    }
     if (!name) {
       return res.status(400).json({ error: 'name is required' })
     }
@@ -36,15 +39,9 @@ router.post('/', checkApiKeyLimit, async (req: Request, res: Response) => {
   }
 })
 
-router.get('/', async (req: Request, res: Response) => {
+router.get('/', async (req: UserRequest, res: Response) => {
   try {
-    const user_id = req.query.user_id as string
-
-    if (!user_id) {
-      return res.status(400).json({ error: 'user_id query param is required' })
-    }
-
-    const apiKeys = await apiKeyService.getUserApiKeys(user_id)
+    const apiKeys = await apiKeyService.getUserApiKeys(req.userId!)
     return res.json({ api_keys: apiKeys })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to fetch API keys'
@@ -52,9 +49,22 @@ router.get('/', async (req: Request, res: Response) => {
   }
 })
 
-router.patch('/:id/revoke', async (req: Request, res: Response) => {
+router.patch('/:id/revoke', async (req: UserRequest, res: Response) => {
   try {
-    await apiKeyService.revokeApiKey(req.params.id)
+    const { id } = req.params
+    const userId = req.userId!
+
+    const { rows } = await db.query(
+      'SELECT id FROM api_keys WHERE id = $1 AND user_id = $2',
+      [id, userId]
+    )
+    if (!rows.length) {
+      return res.status(404).json({ error: 'API key not found' })
+    }
+
+    await apiKeyService.revokeApiKey(id)
+    invalidateKeyCacheById(id)
+
     return res.json({ message: 'API key revoked' })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to revoke API key'
@@ -62,23 +72,21 @@ router.patch('/:id/revoke', async (req: Request, res: Response) => {
   }
 })
 
-router.delete('/:id', async (req: Request, res: Response) => {
+router.delete('/:id', async (req: UserRequest, res: Response) => {
   try {
     const { id } = req.params
-    const user_id = req.headers['x-user-id'] as string
-
-    if (!user_id) {
-      return res.status(401).json({ error: 'x-user-id header is required' })
-    }
+    const userId = req.userId!
 
     const result = await db.query(
       'DELETE FROM api_keys WHERE id = $1 AND user_id = $2',
-      [id, user_id]
+      [id, userId]
     )
 
     if (!result.rowCount) {
       return res.status(404).json({ error: 'API key not found' })
     }
+
+    invalidateKeyCacheById(id)
 
     return res.json({ message: 'API key deleted' })
   } catch (error) {
