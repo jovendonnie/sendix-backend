@@ -1,82 +1,46 @@
 import * as crypto from 'crypto'
-import { supabaseAdmin } from '../lib/supabaseAdmin'
+import { db } from '../lib/db'
 
 const ALLOWED_EVENTS = ['email.delivered', 'email.bounced', 'email.failed', 'email.spam']
 const MAX_RETRIES = 3
 const RETRY_DELAY_MS = 1000
 
-/**
- * Create a new webhook for a user.
- * @param userId - The user ID
- * @param url - The webhook URL
- * @param events - Array of event types to subscribe to
- * @param secret - Secret for HMAC signature
- * @returns The created webhook
- */
 export async function createWebhook(userId: string, url: string, events: string[], secret: string) {
-  const { data, error } = await supabaseAdmin
-    .from('webhooks')
-    .insert({
-      user_id: userId,
-      url,
-      events,
-      secret,
-      active: true,
-    })
-    .select()
-    .single()
-
-  if (error) throw new Error(`Failed to create webhook: ${error.message}`)
-  return data
+  const { rows } = await db.query(
+    `INSERT INTO webhooks (user_id, url, events, secret, active)
+     VALUES ($1, $2, $3, $4, true)
+     RETURNING *`,
+    [userId, url, JSON.stringify(events), secret]
+  )
+  if (!rows[0]) throw new Error('Failed to create webhook')
+  return rows[0]
 }
 
-/**
- * Get all active webhooks for a user.
- * @param userId - The user ID
- * @returns Array of webhooks
- */
 export async function getUserWebhooks(userId: string) {
-  const { data, error } = await supabaseAdmin
-    .from('webhooks')
-    .select('*')
-    .eq('user_id', userId)
-    .eq('active', true)
-    .order('created_at', { ascending: false })
-
-  if (error) throw new Error(`Failed to fetch webhooks: ${error.message}`)
-  return data || []
+  const { rows } = await db.query(
+    `SELECT * FROM webhooks
+     WHERE user_id = $1 AND active = true
+     ORDER BY created_at DESC`,
+    [userId]
+  )
+  return rows
 }
 
-/**
- * Soft delete a webhook by setting active=false.
- * @param id - The webhook ID
- * @param userId - The user ID for ownership check
- */
 export async function deleteWebhook(id: string, userId: string) {
-  const { error } = await supabaseAdmin
-    .from('webhooks')
-    .update({ active: false })
-    .eq('id', id)
-    .eq('user_id', userId)
-
-  if (error) throw new Error(`Failed to delete webhook: ${error.message}`)
+  await db.query(
+    'UPDATE webhooks SET active = false WHERE id = $1 AND user_id = $2',
+    [id, userId]
+  )
 }
 
-/**
- * Deliver a webhook event to the target URL with retry logic.
- * @param webhookId - The webhook ID
- * @param event - The event type
- * @param payload - The payload to send
- */
 export async function deliverWebhook(webhookId: string, event: string, payload: any) {
-  const { data: webhook, error: webhookError } = await supabaseAdmin
-    .from('webhooks')
-    .select('url, secret')
-    .eq('id', webhookId)
-    .single()
-
-  if (webhookError || !webhook) {
-    console.error('Webhook not found:', webhookId)
+  const { rows } = await db.query(
+    'SELECT url, secret FROM webhooks WHERE id = $1',
+    [webhookId]
+  )
+  const webhook = rows[0]
+  if (!webhook) {
+    console.error('[webhook] Not found:', webhookId)
     return
   }
 
@@ -97,38 +61,28 @@ export async function deliverWebhook(webhookId: string, event: string, payload: 
         body: payloadString,
       })
 
-      const delivery = {
-        webhook_id: webhookId,
-        event,
-        payload: payload,
-        status: response.ok ? 'success' : 'failed',
-        response_status: response.status,
-        error: response.ok ? null : `HTTP ${response.status}`,
-        attempt,
-      }
-
-      await supabaseAdmin
-        .from('webhook_deliveries')
-        .insert(delivery)
+      await db.query(
+        `INSERT INTO webhook_deliveries (webhook_id, event, payload, status, response_status, error, attempt)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          webhookId, event, JSON.stringify(payload),
+          response.ok ? 'success' : 'failed',
+          response.status,
+          response.ok ? null : `HTTP ${response.status}`,
+          attempt,
+        ]
+      )
 
       if (response.ok) return
-
       lastError = `HTTP ${response.status}`
     } catch (err: any) {
       lastError = err.message
-
       if (attempt === MAX_RETRIES) {
-        await supabaseAdmin
-          .from('webhook_deliveries')
-          .insert({
-            webhook_id: webhookId,
-            event,
-            payload: payload,
-            status: 'failed',
-            response_status: null,
-            error: lastError,
-            attempt,
-          })
+        await db.query(
+          `INSERT INTO webhook_deliveries (webhook_id, event, payload, status, response_status, error, attempt)
+           VALUES ($1, $2, $3, 'failed', null, $4, $5)`,
+          [webhookId, event, JSON.stringify(payload), lastError, attempt]
+        ).catch(() => {})
       }
     }
 
@@ -138,34 +92,28 @@ export async function deliverWebhook(webhookId: string, event: string, payload: 
   }
 }
 
-/**
- * Trigger all active webhooks for a user that subscribe to a specific event.
- * @param userId - The user ID
- * @param event - The event type
- * @param payload - The payload to send
- */
 export async function triggerWebhooks(userId: string, event: string, payload: any) {
   try {
-    const { data: webhooks, error } = await supabaseAdmin
-      .from('webhooks')
-      .select('id, url, events')
-      .eq('user_id', userId)
-      .eq('active', true)
-      .contains('events', [event])
-
-    if (error) {
-      console.error('Failed to fetch webhooks:', error)
-      return
-    }
+    const { rows: webhooks } = await db.query(
+      `SELECT id, url, events FROM webhooks
+       WHERE user_id = $1 AND active = true`,
+      [userId]
+    )
 
     if (!webhooks || webhooks.length === 0) return
 
     for (const webhook of webhooks) {
-      deliverWebhook(webhook.id, event, payload).catch(err => {
-        console.error(`Webhook delivery failed for ${webhook.id}:`, err)
-      })
+      const subscribedEvents: string[] = Array.isArray(webhook.events)
+        ? webhook.events
+        : JSON.parse(webhook.events || '[]')
+
+      if (subscribedEvents.includes(event)) {
+        deliverWebhook(webhook.id, event, payload).catch(err => {
+          console.error(`[webhook] Delivery failed for ${webhook.id}:`, err)
+        })
+      }
     }
   } catch (err) {
-    console.error('Error triggering webhooks:', err)
+    console.error('[webhook] Error triggering webhooks:', err)
   }
 }

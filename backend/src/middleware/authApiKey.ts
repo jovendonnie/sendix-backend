@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express'
 import bcrypt from 'bcrypt'
-import { supabaseAdmin } from '../lib/supabaseAdmin'
+import { db } from '../lib/db'
 
 export interface AuthenticatedRequest extends Request {
   apiKey?: {
@@ -12,100 +12,125 @@ export interface AuthenticatedRequest extends Request {
   }
 }
 
+const KEY_CACHE_TTL = 5 * 60 * 1000
+
+interface CachedKey {
+  id: string
+  user_id: string
+  name: string
+  scope: string
+  organization_id: string | null
+  expiresAt: number
+}
+
+const keyCache = new Map<string, CachedKey>()
+
+function pruneKeyCache() {
+  const now = Date.now()
+  for (const [k, v] of keyCache) {
+    if (v.expiresAt < now) keyCache.delete(k)
+  }
+}
+
 export async function authApiKey(
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> {
   try {
-    console.log('Validating API key...')
-
     const authHeader = req.headers.authorization
-    console.log('FULL AUTH HEADER:', authHeader)
-
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       res.status(401).json({ error: 'Authorization header required' })
       return
     }
 
     const rawKey = authHeader.slice(7)
-    console.log('EXTRACTED KEY:', rawKey)
-
     if (!rawKey) {
       res.status(401).json({ error: 'API key required' })
       return
     }
 
-    console.log('Fetching API keys from database...')
-
-    const { data: keys, error } = await supabaseAdmin
-      .from('api_keys')
-      .select('id, user_id, name, key_hash, scope, organization_id')
-      .eq('revoked', false)
-
-    if (error) {
-      console.error('Error fetching API keys:', error)
-      res.status(500).json({ error: 'Internal server error' })
+    const cached = keyCache.get(rawKey)
+    if (cached && cached.expiresAt > Date.now()) {
+      ;(req as AuthenticatedRequest).apiKey = {
+        id: cached.id,
+        user_id: cached.user_id,
+        name: cached.name,
+        scope: cached.scope,
+        organization_id: cached.organization_id,
+      }
+      next()
       return
     }
 
-    if (!keys || keys.length === 0) {
-      console.log('No active API keys found')
+    const keyPrefix = rawKey.substring(0, 16)
+
+    const { rows: keys } = await db.query(
+      'SELECT id, user_id, name, key_hash, scope, organization_id FROM api_keys WHERE key_prefix = $1 AND revoked = false',
+      [keyPrefix]
+    )
+
+    const candidates = (keys && keys.length > 0) ? keys : await _legacyFullScan()
+
+    if (!candidates || candidates.length === 0) {
       res.status(401).json({ error: 'Invalid API key' })
       return
     }
 
-    console.log(`Checking against ${keys.length} active keys...`)
+    for (const key of candidates) {
+      if (!key.key_hash) continue
 
-    for (const key of keys) {
-      console.log('RAW KEY:', rawKey)
-      console.log('KEY ID:', key.id)
-      console.log('HASH FROM DB:', key.key_hash ? 'exists' : 'missing')
-      console.log('KEY FORMAT:', rawKey.substring(0, 8))
-      
-      if (key.key_hash) {
-        try {
-          const isMatch = await bcrypt.compare(rawKey, key.key_hash)
-          console.log('Match result:', isMatch)
-          
-          if (isMatch) {
-             console.log('MATCH FOUND:', key.id)
-             ;(req as AuthenticatedRequest).apiKey = {
-               id: key.id,
-               user_id: key.user_id,
-               name: key.name,
-               scope: key.scope || 'full_access',
-               organization_id: (key as any).organization_id ?? null,
-             }
-             next()
-             return
-           }
-        } catch (compareErr) {
-          console.error('Bcrypt compare error:', compareErr)
+      const isMatch = await bcrypt.compare(rawKey, key.key_hash)
+      if (isMatch) {
+        const entry: CachedKey = {
+          id: key.id,
+          user_id: key.user_id,
+          name: key.name,
+          scope: key.scope || 'full_access',
+          organization_id: key.organization_id ?? null,
+          expiresAt: Date.now() + KEY_CACHE_TTL,
         }
+
+        keyCache.set(rawKey, entry)
+        if (keyCache.size > 1000) pruneKeyCache()
+
+        ;(req as AuthenticatedRequest).apiKey = {
+          id: entry.id,
+          user_id: entry.user_id,
+          name: entry.name,
+          scope: entry.scope,
+          organization_id: entry.organization_id,
+        }
+        next()
+        return
       }
     }
 
-    console.log('No matching API key found')
     res.status(401).json({ error: 'Invalid API key' })
   } catch (err) {
-    console.error('Auth error:', err)
+    console.error('[authApiKey] Unexpected error:', err)
     res.status(500).json({ error: 'Authentication failed' })
   }
 }
 
-/**
- * Check if the API key scope allows the requested operation.
- * full_access: can do everything
- * send_only: can only POST to /emails endpoints
- * read_only: can only GET /emails endpoints
- */
-export function checkScope(req: AuthenticatedRequest, requiredScope: 'full_access' | 'send_only' | 'read_only'): boolean {
-  const scope = req.apiKey?.scope || 'full_access'
+async function _legacyFullScan() {
+  const { rows } = await db.query(
+    'SELECT id, user_id, name, key_hash, scope, organization_id FROM api_keys WHERE revoked = false'
+  )
+  return rows
+}
 
+export function checkScope(
+  req: AuthenticatedRequest,
+  requiredScope: 'full_access' | 'send_only' | 'read_only'
+): boolean {
+  const scope = req.apiKey?.scope || 'full_access'
   if (scope === 'full_access') return true
   if (scope === 'send_only' && req.method === 'POST') return true
   if (scope === 'read_only' && req.method === 'GET') return true
-
   return false
+}
+
+export function invalidateKeyCache(rawKey: string) {
+  keyCache.delete(rawKey)
 }

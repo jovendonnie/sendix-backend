@@ -1,57 +1,46 @@
 import { Router, Response } from 'express'
-import { authSupabaseUser, UserRequest } from '../middleware/authSupabaseUser'
+import { authClerkUser, UserRequest } from '../middleware/authClerkUser'
 import {
   registerDomain,
   verifyDomainStatus,
   revokeDomain,
 } from '../services/domain-ses.service'
-import { supabaseAdmin } from '../lib/supabaseAdmin'
+import { db } from '../lib/db'
 
 const router = Router()
 
-// All domain routes require a valid Supabase session from the frontend
-router.use(authSupabaseUser)
+router.use(authClerkUser)
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api/domains
-// List all domains for the authenticated user
-// ─────────────────────────────────────────────────────────────────────────────
 router.get('/', async (req: UserRequest, res: Response) => {
   try {
     const userId = req.userId!
 
-    const { data, error } = await supabaseAdmin
-      .from('domains')
-      .select('id, domain, verified, ses_verification_status, ses_dkim_tokens, ses_verified_at, verification_attempts, created_at')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
+    const { rows } = await db.query(
+      `SELECT id, domain, verified, ses_verification_status, ses_dkim_tokens,
+              ses_verified_at, verification_attempts, created_at
+       FROM domains
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
+      [userId]
+    )
 
-    if (error) {
-      return res.status(500).json({ error: error.message })
-    }
-
-    return res.json({ domains: data || [] })
+    return res.json({ domains: rows })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to fetch domains'
     return res.status(500).json({ error: message })
   }
 })
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/domains
-// Register a new domain with AWS SES and get CNAME tokens
-// ─────────────────────────────────────────────────────────────────────────────
 router.post('/', async (req: UserRequest, res: Response) => {
   try {
-    const userId         = req.userId!
-    const userPlan       = req.userPlan || 'free'
+    const userId   = req.userId!
+    const userPlan = req.userPlan || 'free'
     const { domain, organization_id } = req.body
 
     if (!domain || typeof domain !== 'string') {
       return res.status(400).json({ error: 'domain is required' })
     }
 
-    // Plan gate — enforce before calling AWS
     if (!['pro', 'agency'].includes(userPlan)) {
       return res.status(403).json({
         error:   'Plan Pro o Agency requerido para verificar dominios propios',
@@ -68,10 +57,9 @@ router.post('/', async (req: UserRequest, res: Response) => {
     }
 
     return res.status(201).json({
-      domain:      result.domain,
-      dkimTokens:  result.dkimTokens,
-      // Helper: pre-built DNS records for the frontend to display
-      dnsRecords:  buildDnsRecords(result.domain!.domain, result.dkimTokens || []),
+      domain:     result.domain,
+      dkimTokens: result.dkimTokens,
+      dnsRecords: buildDnsRecords(result.domain!.domain, result.dkimTokens || []),
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to register domain'
@@ -79,10 +67,6 @@ router.post('/', async (req: UserRequest, res: Response) => {
   }
 })
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/domains/:id/verify
-// Ask SES for the current verification status
-// ─────────────────────────────────────────────────────────────────────────────
 router.post('/:id/verify', async (req: UserRequest, res: Response) => {
   try {
     const userId   = req.userId!
@@ -101,10 +85,6 @@ router.post('/:id/verify', async (req: UserRequest, res: Response) => {
   }
 })
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DELETE /api/domains/:id
-// Revoke domain from SES and delete the record
-// ─────────────────────────────────────────────────────────────────────────────
 router.delete('/:id', async (req: UserRequest, res: Response) => {
   try {
     const userId   = req.userId!
@@ -123,10 +103,6 @@ router.delete('/:id', async (req: UserRequest, res: Response) => {
   }
 })
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
 interface DnsRecord {
   type:  string
   name:  string
@@ -138,7 +114,6 @@ interface DnsRecord {
 function buildDnsRecords(domain: string, dkimTokens: string[]): DnsRecord[] {
   const records: DnsRecord[] = []
 
-  // DKIM CNAME records (3 tokens from Easy DKIM)
   dkimTokens.forEach(token => {
     records.push({
       type:        'CNAME',
@@ -149,7 +124,6 @@ function buildDnsRecords(domain: string, dkimTokens: string[]): DnsRecord[] {
     })
   })
 
-  // SPF
   records.push({
     type:        'TXT',
     name:        domain,
@@ -158,7 +132,6 @@ function buildDnsRecords(domain: string, dkimTokens: string[]): DnsRecord[] {
     description: 'SPF — authorises Amazon SES to send on behalf of this domain',
   })
 
-  // DMARC (recommended)
   records.push({
     type:        'TXT',
     name:        `_dmarc.${domain}`,

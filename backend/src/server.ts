@@ -4,7 +4,9 @@ import 'dotenv/config'
 import apiRoutes from './routes/index'
 import v1Routes from './routes/v1'
 import unsubscribeRouter from './routes/unsubscribe.route'
+import clerkWebhookRouter from './routes/webhooks-clerk.route'
 import { startMonthlyCron } from './lib/cron'
+import { apiRateLimiter, authRateLimiter } from './middleware/rateLimiter'
 
 const app = express()
 const port = process.env.PORT || 3001
@@ -23,14 +25,25 @@ app.use(cors({
 }))
 
 // Conditional body parsing
-// - Stripe webhook: raw buffer (needs signature verification against raw bytes)
-// - SNS webhook:    text (SNS sends JSON with Content-Type: text/plain, not application/json)
+// - Stripe webhook:  raw buffer (signature verification)
+// - Clerk webhook:   raw buffer (svix signature verification)
+// - SNS webhook:     text (SNS sends JSON with Content-Type: text/plain)
 // - Everything else: JSON
 app.use((req, res, next) => {
   if (req.path === '/api/billing/webhook') {
     express.raw({ type: 'application/json' })(req, res, next)
-  } else if (req.path === '/api/webhooks/ses') {
-    express.text({ type: '*/*' })(req, res, next)
+  } else if (req.path === '/api/webhooks/clerk') {
+    express.raw({ type: 'application/json' })(req, res, next)
+  } else if (req.path === '/api/webhooks/ses' || req.path.startsWith('/api/webhooks/ingest/')) {
+    // SNS and provider ingest webhooks may arrive as text/plain or application/json
+    express.text({ type: '*/*' })(req, res, (err) => {
+      if (err) return next(err)
+      // Try to parse text body as JSON for ingest route
+      if (typeof req.body === 'string') {
+        try { (req as any).body = JSON.parse(req.body) } catch { /* keep raw string */ }
+      }
+      next()
+    })
   } else {
     express.json()(req, res, next)
   }
@@ -49,6 +62,17 @@ app.get('/test', (req, res) => {
 
 // Unsubscribe — public, no auth, must be before /api to avoid conflicts
 app.use('/unsubscribe', unsubscribeRouter)
+
+// Clerk webhook — public (signature-verified), raw body already parsed above
+app.use('/api/webhooks/clerk', clerkWebhookRouter)
+
+// Rate limiting — auth endpoints: 10 req/15min per IP
+// Covers login, register, and password-reset token flows
+app.use('/api/auth', authRateLimiter)
+
+// Rate limiting — general API: 200 req/15min per IP
+app.use('/api', apiRateLimiter)
+app.use('/api/v1', apiRateLimiter)
 
 // API Routes (prefixed with /api)
 app.use('/api', apiRoutes)

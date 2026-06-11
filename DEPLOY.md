@@ -883,7 +883,7 @@ Las imágenes en GHCR son **privadas por defecto**. El Droplet necesita un Perso
 **Autenticar en el Droplet** (reemplaza `ghp_TUTOKEN` con el token copiado):
 
 ```bash
-echo "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" | docker login ghcr.io -u jovendonnie --password-stdin
+echo "ghp_TUTOKEN" | docker login ghcr.io -u jovendonnie --password-stdin
 # Resultado esperado: Login Succeeded
 ```
 

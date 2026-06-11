@@ -1,11 +1,13 @@
 import { Resend } from 'resend'
 import type { EmailPayload, EmailSendResult } from './smtp-email.service'
 
-const resend = new Resend(process.env.RESEND_API_KEY)
-
 const DEFAULT_FROM = process.env.EMAIL_FROM || 'SendIX <onboarding@resend.dev>'
 
-export async function sendEmailViaResend(payload: EmailPayload): Promise<EmailSendResult> {
+export async function sendEmailViaResend(payload: EmailPayload, apiKey?: string): Promise<EmailSendResult> {
+  const key = apiKey || process.env.RESEND_API_KEY
+  if (!key) return { success: false, error: 'No Resend API key configured' }
+
+  const resend = new Resend(key)
   const { to, from, subject, html, text } = payload
 
   try {

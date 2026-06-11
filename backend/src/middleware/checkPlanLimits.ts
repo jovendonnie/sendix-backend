@@ -1,8 +1,6 @@
 import { Request, Response, NextFunction } from 'express'
-import { supabaseAdmin } from '../lib/supabaseAdmin'
+import { db } from '../lib/db'
 import { AuthenticatedRequest } from './authApiKey'
-
-// ─── Plan limits (source of truth) ───────────────────────────────────────────
 
 const PLAN_EMAIL_LIMITS: Record<string, number> = {
   free:   3_000,
@@ -16,16 +14,6 @@ const PLAN_KEY_LIMITS: Record<string, number> = {
   agency: 999,
 }
 
-// ─── Email send limit ─────────────────────────────────────────────────────────
-
-/**
- * Middleware that enforces monthly email send limits.
- *
- * Reads `emails_sent_this_month` and `email_limit` directly from `profiles`
- * (O(1) — no aggregation). These columns are added by Migración 1.
- *
- * Must run AFTER `authApiKey`.
- */
 export async function checkEmailLimit(
   req: AuthenticatedRequest,
   res: Response,
@@ -38,24 +26,21 @@ export async function checkEmailLimit(
       return
     }
 
-    const { data: profile, error } = await supabaseAdmin
-      .from('profiles')
-      .select('plan, emails_sent_this_month, email_limit')
-      .eq('id', userId)
-      .single()
+    const { rows } = await db.query(
+      'SELECT plan, emails_sent_this_month, email_limit FROM profiles WHERE id = $1',
+      [userId]
+    )
+    const profile = rows[0]
 
-    if (error || !profile) {
-      // Can't verify limits → allow the send but log the issue
-      console.warn('[checkEmailLimit] Could not fetch profile, skipping limit check:', error?.message)
+    if (!profile) {
+      console.warn('[checkEmailLimit] Could not fetch profile, skipping limit check')
       next()
       return
     }
 
-    const plan = profile.plan || 'free'
+    const plan  = profile.plan || 'free'
     const limit = (profile.email_limit as number | null) ?? PLAN_EMAIL_LIMITS[plan] ?? 3_000
 
-    // If the counter column hasn't been migrated yet (null), fall back to
-    // counting directly from the messages table (always accurate, just slower).
     let sent: number
     if (profile.emails_sent_this_month !== null && profile.emails_sent_this_month !== undefined) {
       sent = profile.emails_sent_this_month as number
@@ -63,12 +48,11 @@ export async function checkEmailLimit(
       const startOfMonth = new Date()
       startOfMonth.setUTCDate(1)
       startOfMonth.setUTCHours(0, 0, 0, 0)
-      const { count } = await supabaseAdmin
-        .from('messages')
-        .select('*', { count: 'exact', head: true })
-        .eq('user_id', userId)
-        .gte('created_at', startOfMonth.toISOString())
-      sent = count || 0
+      const { rows: countRows } = await db.query(
+        'SELECT COUNT(*) as count FROM messages WHERE user_id = $1 AND created_at >= $2',
+        [userId, startOfMonth.toISOString()]
+      )
+      sent = parseInt(countRows[0]?.count || '0', 10)
     }
 
     if (sent >= limit) {
@@ -83,17 +67,13 @@ export async function checkEmailLimit(
       return
     }
 
-    // Attach for downstream use
     ;(req as any).planInfo = { plan, limit, sent }
     next()
   } catch (err) {
-    // Never block a send due to a limit-check crash — log and allow
     console.error('[checkEmailLimit] Unexpected error, allowing send:', err)
     next()
   }
 }
-
-// ─── API key count limit ──────────────────────────────────────────────────────
 
 export async function checkApiKeyLimit(
   req: Request,
@@ -104,22 +84,20 @@ export async function checkApiKeyLimit(
     const userId = req.headers['x-user-id'] as string
     if (!userId) { next(); return }
 
-    const { data: profile } = await supabaseAdmin
-      .from('profiles')
-      .select('plan')
-      .eq('id', userId)
-      .single()
-
-    const plan     = profile?.plan || 'free'
+    const { rows: profileRows } = await db.query(
+      'SELECT plan FROM profiles WHERE id = $1',
+      [userId]
+    )
+    const plan     = profileRows[0]?.plan || 'free'
     const keyLimit = PLAN_KEY_LIMITS[plan] ?? 1
 
-    const { count } = await supabaseAdmin
-      .from('api_keys')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', userId)
-      .eq('revoked', false)
+    const { rows: keyRows } = await db.query(
+      'SELECT COUNT(*) as count FROM api_keys WHERE user_id = $1 AND revoked = false',
+      [userId]
+    )
+    const count = parseInt(keyRows[0]?.count || '0', 10)
 
-    if ((count || 0) >= keyLimit) {
+    if (count >= keyLimit) {
       res.status(402).json({
         error: `API key limit reached. Your ${plan} plan allows ${keyLimit === 999 ? 'unlimited' : keyLimit} API key${keyLimit === 1 ? '' : 's'}.`,
         code:  'API_KEY_LIMIT_REACHED',
@@ -135,35 +113,13 @@ export async function checkApiKeyLimit(
   }
 }
 
-// ─── Counter increment helper (used by send route) ───────────────────────────
-
-/**
- * Increment `emails_sent_this_month` for a user after a successful send.
- * Pass `count = batch.length` for bulk sends.
- *
- * Uses fetch-then-update (not RPC) to avoid requiring a DB function.
- * Race condition is negligible at SendIX's scale.
- */
 export async function incrementEmailCounter(userId: string, count = 1): Promise<void> {
   try {
-    const { data: profile } = await supabaseAdmin
-      .from('profiles')
-      .select('emails_sent_this_month')
-      .eq('id', userId)
-      .single()
-
-    const current = (profile?.emails_sent_this_month as number | null) ?? 0
-
-    const { error } = await supabaseAdmin
-      .from('profiles')
-      .update({ emails_sent_this_month: current + count })
-      .eq('id', userId)
-
-    if (error) {
-      console.error('[checkPlanLimits] Failed to increment email counter:', error.message)
-    }
+    await db.query(
+      'UPDATE profiles SET emails_sent_this_month = COALESCE(emails_sent_this_month, 0) + $2 WHERE id = $1',
+      [userId, count]
+    )
   } catch (err) {
-    // Non-fatal: a counter miss is better than losing the send
-    console.error('[checkPlanLimits] Unexpected error incrementing counter:', err)
+    console.error('[checkPlanLimits] Failed to increment email counter:', err)
   }
 }
