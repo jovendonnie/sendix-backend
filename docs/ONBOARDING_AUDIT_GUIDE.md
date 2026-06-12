@@ -1,8 +1,8 @@
 # Onboarding System — Auditoría y Guía de Implementación General
 
-> Auditado sobre: **Sendix Frontend** (React + Vite + Tailwind + Clerk)  
-> Stack objetivo: **Angular + C# (ASP.NET Core + Entity Framework Core) + NeonDB (PostgreSQL)**  
-> Fecha: 2026-06-10
+> Auditado sobre: **Sendix Frontend** (React + Vite + TypeScript + Clerk)  
+> Stack actual: **React + Vite + TS + Clerk** (frontend) · **C# ASP.NET Core + EF Core + NeonDB** (backend objetivo)  
+> Fecha actualizada: 2026-06-11
 
 ---
 
@@ -11,7 +11,7 @@
 1. [Auditoría del sistema actual](#1-auditoría-del-sistema-actual)
 2. [Arquitectura general del patrón Onboarding](#2-arquitectura-general-del-patrón-onboarding)
 3. [Backend — C# + EF Core + NeonDB](#3-backend--c-ef-core-neondb)
-4. [Frontend — Angular](#4-frontend--angular)
+4. [Frontend — React + Vite + TypeScript](#4-frontend--react--vite--typescript)
 5. [Flujo de datos completo](#5-flujo-de-datos-completo)
 6. [Checklist de calidad UX/UI](#6-checklist-de-calidad-uxui)
 
@@ -19,81 +19,104 @@
 
 ## 1. Auditoría del sistema actual
 
+> El onboarding vive en `frontend/src/app/dashboard/page.tsx` como un card inline dentro del dashboard principal. No es una página separada ni un wizard multi-step.
+
 ### 1.1 ¿Qué hace bien?
 
 | Aspecto | Descripción |
 |---------|-------------|
 | **Diseño visual limpio** | Card con `bg-primary/5` + `border-primary/20` da identidad sin sobrecargar. |
 | **Progress bar animado** | `transition-all duration-700` con porcentaje numérico — feedback claro. |
-| **Completions desde datos reales** | Cada paso se completa con datos del backend, no con flags manuales. |
-| **Steps condicionales por plan** | El paso "Invite member" solo aparece en Pro/Agency — UX correcta. |
+| **Completions desde datos reales** | Cada paso se completa con datos del backend (`providers.length`, `apiKeys.length`, `hasVerifiedDomain`). |
 | **Auto-dismiss al completar** | `useEffect` que observa `allCompleted` — no requiere acción del usuario. |
 | **Responsive** | Grid `sm:grid-cols-2` — funciona en móvil y desktop. |
-| **Empty states** | Cada sección del dashboard (API Keys, Activity) tiene su estado vacío con CTA. |
+| **Carga paralela de datos** | `Promise.allSettled` para los 4 endpoints del dashboard. |
+| **Timeout de red** | `AbortController` con 8s de timeout para evitar cuelgues. |
 
 ---
 
-### 1.2 Problemas encontrados
+### 1.2 Steps actuales del onboarding
+
+Los pasos correctos — derivados del código real en `page.tsx:97-102` — son:
+
+| ID | Label | Condición de completitud | Ruta |
+|----|-------|--------------------------|------|
+| `account` | Create your account | Siempre `true` | — |
+| `provider` | Connect your first provider | `providers.length > 0` | `/dashboard/providers` |
+| `api_key` | Create your first API Key | `apiKeys.length > 0` | `/dashboard/api-keys` |
+| `domain` | Verify a domain | `hasVerifiedDomain` (algún dominio con `verified: true`) | `/dashboard/domains` |
+
+> **No existe** un paso "Send your first email" ni "Invite a team member" en la implementación actual. El paso crítico de SendIX — y que el audit anterior no contemplaba — es **conectar un provider** (Resend, Brevo, AWS SES, Mailgun, Postmark). Este paso refleja la identidad del producto como orquestador de proveedores, no como cartero directo.
+
+---
+
+### 1.3 Problemas encontrados
 
 #### 🔴 Crítico
 
 **P1 — Estado de dismiss no persiste**
 ```typescript
-// ❌ Actual: solo en memoria
+// ❌ Actual: solo en memoria (page.tsx:92)
 const [onboardingDismissed, setOnboardingDismissed] = useState(false);
 // Se pierde al recargar la página — el onboarding reaparece siempre
+
+// ✅ Fix mínimo: localStorage
+const [onboardingDismissed, setOnboardingDismissed] = useState(
+  () => localStorage.getItem("onboarding_dismissed") === "true"
+);
+// Al hacer dismiss:
+localStorage.setItem("onboarding_dismissed", "true");
+setOnboardingDismissed(true);
+
+// ✅ Fix ideal: persistir en el backend (user_onboarding.dismissed)
+// PATCH /api/onboarding/dismiss → DB: user_onboarding.dismissed = true
 ```
-**Impacto:** El usuario que descarta el onboarding lo vuelve a ver en cada recarga.  
-**Fix:** Persistir en `localStorage` o, mejor, en el backend (`user_settings.onboarding_dismissed`).
+**Impacto:** El usuario que descarta el onboarding lo vuelve a ver en cada recarga.
 
 ---
 
-**P2 — `membersCount` está hardcodeado**
-```typescript
-// ❌ En fetchData():
-setMembersCount(1);
-// El paso "Invite member" NUNCA se completa, aunque existan miembros
-```
-**Impacto:** Un usuario Pro/Agency que ya invitó miembros sigue viendo el paso como pendiente.  
-**Fix:** Llamar al endpoint de miembros de la organización y contar los resultados.
-
----
-
-**P3 — Steps clickeables no son elementos `<button>`**
+**P2 — Steps clickeables son `<div>` con onClick, no `<button>`**
 ```tsx
-// ❌ Actual: div con onClick
-<div onClick={() => step.href && !step.completed && navigate(step.href)} ...>
-```
-**Impacto:** No funciona con teclado (Tab + Enter), no accesible para screen readers, sin foco visible.  
-**Fix (WCAG 2.1 AA):**
-```tsx
-// ✅ Correcto
+// ❌ Actual (page.tsx:298)
+<div
+  onClick={() => step.href && !step.completed && navigate(step.href)}
+  className="..."
+>
+
+// ✅ Correcto — accesible con teclado
 <button
   onClick={() => step.href && !step.completed && navigate(step.href)}
   disabled={step.completed || !step.href}
   aria-label={`${step.label}: ${step.completed ? "completado" : "pendiente"}`}
-  ...
+  className="..."
 >
 ```
+**Impacto:** No funciona con Tab + Enter, invisible para screen readers, sin foco visible. Viola WCAG 2.1 AA.
 
 ---
 
 #### 🟡 Importante
 
-**P4 — Sin skeleton durante carga inicial**
+**P3 — Sin skeleton durante carga inicial**
 ```typescript
-// ❌ Actual: spinner global que oculta todo el dashboard
-if (loading) return <div className="...spinner..." />;
+// ❌ Actual (page.tsx:162-168): spinner global que oculta todo el dashboard
+if (loading) return (
+  <div className="flex items-center justify-center h-[400px]">
+    <div className="animate-spin ..." />
+  </div>
+);
 ```
-**Impacto:** Los steps se muestran como "incompletos" durante el fetch inicial, creando un flash visual.  
-**Fix:** Mostrar skeleton del card de onboarding mientras se cargan los datos.
+**Impacto:** Los steps se muestran como "incompletos" durante el fetch inicial, creando un flash visual. Considerar skeleton del card de onboarding mientras se cargan los datos.
 
 ---
 
-**P5 — Progress bar sin `role="progressbar"`**
+**P4 — Progress bar sin `role="progressbar"`**
 ```tsx
-// ❌ Sin atributos ARIA
-<div className="h-full rounded-full bg-primary ...">
+// ❌ Sin atributos ARIA (page.tsx:283-285)
+<div className="w-28 h-1.5 rounded-full bg-border overflow-hidden">
+  <div className="h-full rounded-full bg-primary ..." />
+</div>
+
 // ✅ Correcto
 <div
   role="progressbar"
@@ -101,58 +124,66 @@ if (loading) return <div className="...spinner..." />;
   aria-valuemin={0}
   aria-valuemax={steps.length}
   aria-label="Progreso de configuración"
-  className="h-full rounded-full bg-primary ..."
-/>
+  className="w-28 h-1.5 rounded-full bg-border overflow-hidden"
+>
+  <div className="h-full rounded-full bg-primary ..." />
+</div>
 ```
 
 ---
 
-**P6 — Botón "Dismiss" con target de toque insuficiente**
+**P5 — Botón "Dismiss" con target de toque insuficiente**
 ```tsx
-// ❌ Solo px-2 py-1 → aproximadamente 28px de alto
-<button className="text-xs text-muted hover:text-text px-2 py-1 ...">
+// ❌ Solo px-2 py-1 ≈ 28px de alto (page.tsx:288)
+<button className="text-xs text-muted hover:text-text px-2 py-1 rounded-lg ...">
   Dismiss
 </button>
+
 // ✅ Mínimo 44×44px (Apple HIG / WCAG)
-<button className="text-xs text-muted hover:text-text px-3 py-2 min-h-[44px] ...">
+<button className="text-xs text-muted hover:text-text px-3 py-2.5 min-h-[44px] rounded-lg ...">
+  Dismiss
+</button>
 ```
 
 ---
 
-**P7 — Sin feedback de transición al completar un paso**
-Cuando un paso pasa de pendiente a completado, solo cambia opacity sin animación.  
-**Fix:** Agregar `transition-all duration-500` y un micro-scale en el checkmark.
+**P6 — Sin feedback de transición al completar un paso**
+Cuando un paso pasa de pendiente a completado solo cambia opacity/color sin animación.
+**Fix:** `transition-all duration-500` + micro-scale en el checkmark al completarse.
 
 ---
 
 #### 🟢 Mejoras opcionales
 
-**P8 — Sin `aria-live` para screen readers**  
-Cuando se completa un paso, un screen reader no recibe notificación.  
-**Fix:** `<div aria-live="polite" aria-atomic="true">` alrededor del contador "X of Y completed".
+**P7 — Sin `aria-live` para screen readers**
+Cuando se completa un paso, un screen reader no recibe notificación.
+```tsx
+<p aria-live="polite" aria-atomic="true" className="text-xs text-muted">
+  {completedCount} of {steps.length} completed
+</p>
+```
 
-**P9 — Mensaje de motivación en el último paso**  
+**P8 — Mensaje de motivación en el último paso**
 Cuando `completedCount === steps.length - 1`, mostrar "¡Un paso más!" para incentivar.
 
-**P10 — Sin Deep Link a la card de onboarding**  
+**P9 — Sin Deep Link al card de onboarding**
 Si el usuario navega y vuelve, no hay forma de anclar al onboarding. Considerar `?setup=true` en la URL.
 
 ---
 
-### 1.3 Tabla de severidad
+### 1.4 Tabla de severidad
 
 | ID | Severidad | Categoría | Esfuerzo de Fix |
 |----|-----------|-----------|-----------------|
 | P1 | 🔴 Crítico | Persistencia | Bajo (localStorage) / Medio (backend) |
-| P2 | 🔴 Crítico | Datos | Bajo |
-| P3 | 🔴 Crítico | Accesibilidad | Bajo |
-| P4 | 🟡 Importante | UX / Loading | Medio |
-| P5 | 🟡 Importante | Accesibilidad | Bajo |
-| P6 | 🟡 Importante | Touch UX | Bajo |
-| P7 | 🟡 Importante | Animación | Bajo |
-| P8 | 🟢 Opcional | Accesibilidad | Bajo |
-| P9 | 🟢 Opcional | UX copywriting | Muy bajo |
-| P10 | 🟢 Opcional | Navegación | Medio |
+| P2 | 🔴 Crítico | Accesibilidad | Bajo |
+| P3 | 🟡 Importante | UX / Loading | Medio |
+| P4 | 🟡 Importante | Accesibilidad | Bajo |
+| P5 | 🟡 Importante | Touch UX | Bajo |
+| P6 | 🟡 Importante | Animación | Bajo |
+| P7 | 🟢 Opcional | Accesibilidad | Bajo |
+| P8 | 🟢 Opcional | UX copywriting | Muy bajo |
+| P9 | 🟢 Opcional | Navegación | Medio |
 
 ---
 
@@ -183,8 +214,8 @@ OnboardingCard:
 | Tipo | Condición de completitud |
 |------|--------------------------|
 | `always_true` | El usuario ya tiene cuenta. Siempre true. |
-| `resource_exists` | Al menos un recurso existe (API key, dominio, etc.) |
-| `resource_verified` | Un recurso específico tiene un estado verificado |
+| `resource_exists` | Al menos un recurso existe (provider, API key, dominio) |
+| `resource_verified` | Un recurso específico tiene estado verificado (dominio con `verified: true`) |
 | `action_performed` | El usuario realizó una acción (envió un email) |
 | `members_count` | La organización tiene más de N miembros |
 | `plan_based` | Solo visible para ciertos planes (conditionally rendered) |
@@ -210,11 +241,10 @@ CREATE TABLE user_onboarding (
     UNIQUE(user_id)
 );
 
--- Índice para queries frecuentes
 CREATE INDEX idx_user_onboarding_user_id ON user_onboarding(user_id);
 ```
 
-> **Nota:** Los steps individuales NO se guardan como filas. El estado de cada step se calcula en tiempo real desde los datos reales (API keys, dominios, emails enviados). Solo se persiste el flag `dismissed`.
+> **Nota:** Los steps individuales NO se guardan como filas. El estado de cada step se calcula en tiempo real desde los datos reales (providers, API keys, dominios verificados). Solo se persiste el flag `dismissed`.
 
 ---
 
@@ -232,7 +262,6 @@ public class UserOnboarding
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 
-    // Navigation
     public User User { get; set; } = null!;
 }
 ```
@@ -255,15 +284,9 @@ public class ApplicationDbContext : DbContext
 }
 ```
 
-```csharp
-// Migrations: agregar en Package Manager Console
-// Add-Migration AddUserOnboarding
-// Update-Database
-```
-
 ---
 
-### 3.3 DTO y respuestas
+### 3.3 DTOs y respuestas
 
 ```csharp
 // DTOs/OnboardingDto.cs
@@ -309,11 +332,10 @@ public class OnboardingService : IOnboardingService
 
     public async Task<OnboardingStatusDto> GetStatusAsync(Guid userId)
     {
-        // Cargar todos los datos en paralelo
-        var (onboarding, apiKeyCount, emailCount, hasVerifiedDomain, memberCount, userPlan) =
+        var (onboarding, providerCount, apiKeyCount, hasVerifiedDomain, memberCount, userPlan) =
             await LoadUserDataAsync(userId);
 
-        var steps = BuildSteps(apiKeyCount, emailCount, hasVerifiedDomain, memberCount, userPlan);
+        var steps = BuildSteps(providerCount, apiKeyCount, hasVerifiedDomain, memberCount, userPlan);
 
         return new OnboardingStatusDto(
             Dismissed: onboarding?.Dismissed ?? false,
@@ -325,26 +347,26 @@ public class OnboardingService : IOnboardingService
 
     private async Task<(UserOnboarding?, int, int, bool, int, string)> LoadUserDataAsync(Guid userId)
     {
-        var onboardingTask    = _db.UserOnboardings.FirstOrDefaultAsync(o => o.UserId == userId);
-        var apiKeyCountTask   = _db.ApiKeys.CountAsync(k => k.UserId == userId && !k.Revoked);
-        var emailCountTask    = _db.Messages.CountAsync(m => m.UserId == userId);
+        var onboardingTask     = _db.UserOnboardings.FirstOrDefaultAsync(o => o.UserId == userId);
+        var providerCountTask  = _db.Providers.CountAsync(p => p.UserId == userId);
+        var apiKeyCountTask    = _db.ApiKeys.CountAsync(k => k.UserId == userId && !k.Revoked);
         var verifiedDomainTask = _db.Domains.AnyAsync(d => d.UserId == userId && d.Verified);
-        var memberCountTask   = _db.OrganizationMembers.CountAsync(m => m.OrganizationId ==
+        var memberCountTask    = _db.OrganizationMembers.CountAsync(m => m.OrganizationId ==
                                     _db.Organizations.Where(o => o.OwnerId == userId)
                                                      .Select(o => o.Id)
                                                      .FirstOrDefault());
-        var userPlanTask      = _db.UserBillings
-                                   .Where(b => b.UserId == userId)
-                                   .Select(b => b.Plan)
-                                   .FirstOrDefaultAsync();
+        var userPlanTask       = _db.UserBillings
+                                    .Where(b => b.UserId == userId)
+                                    .Select(b => b.Plan)
+                                    .FirstOrDefaultAsync();
 
-        await Task.WhenAll(onboardingTask, apiKeyCountTask, emailCountTask,
+        await Task.WhenAll(onboardingTask, providerCountTask, apiKeyCountTask,
                            verifiedDomainTask, memberCountTask, userPlanTask);
 
         return (
             await onboardingTask,
+            await providerCountTask,
             await apiKeyCountTask,
-            await emailCountTask,
             await verifiedDomainTask,
             await memberCountTask,
             await userPlanTask ?? "free"
@@ -352,15 +374,15 @@ public class OnboardingService : IOnboardingService
     }
 
     private List<OnboardingStepDto> BuildSteps(
-        int apiKeyCount, int emailCount, bool hasVerifiedDomain,
+        int providerCount, int apiKeyCount, bool hasVerifiedDomain,
         int memberCount, string plan)
     {
         var steps = new List<OnboardingStepDto>
         {
-            new("account",       "Create your account",      "You're in!",                                            true,                      null),
-            new("api_key",       "Create your first API Key","Generate a key to start sending",                       apiKeyCount > 0,           "/dashboard/api-keys"),
-            new("send_email",    "Send your first email",    "Send a test email to verify everything works",          emailCount > 0,            "/dashboard/send"),
-            new("verify_domain", "Verify a domain",          "Send emails from your own domain",                     hasVerifiedDomain,         "/dashboard/domains"),
+            new("account",  "Create your account",          "You're in!",                                       true,                    null),
+            new("provider", "Connect your first provider",  "Add Resend, Brevo, SES or another provider",       providerCount > 0,       "/dashboard/providers"),
+            new("api_key",  "Create your first API Key",    "Generate a key to start sending emails via API",   apiKeyCount > 0,         "/dashboard/api-keys"),
+            new("domain",   "Verify a domain",              "Send emails from your own domain",                 hasVerifiedDomain,       "/dashboard/domains"),
         };
 
         // Step condicional por plan
@@ -435,7 +457,6 @@ public class OnboardingController : ControllerBase
 
     private Guid GetCurrentUserId()
     {
-        // Adaptar según tu sistema de auth (JWT claims, etc.)
         var sub = User.FindFirstValue(ClaimTypes.NameIdentifier)
                   ?? throw new UnauthorizedAccessException();
         return Guid.Parse(sub);
@@ -448,7 +469,6 @@ public class OnboardingController : ControllerBase
 ### 3.6 Registro de servicios (Program.cs)
 
 ```csharp
-// Program.cs
 builder.Services.AddScoped<IOnboardingService, OnboardingService>();
 ```
 
@@ -460,7 +480,7 @@ builder.Services.AddScoped<IOnboardingService, OnboardingService>();
 // appsettings.json
 {
   "ConnectionStrings": {
-    "DefaultConnection": "Host=<neon-host>;Database=<db>;Username=<user>;Password=<pass>;SSL Mode=Require;Trust Server Certificate=true"
+    "DefaultConnection": "Host=<neon-host>;Database=<db>;Username=<user>;Password=<pass>;SSL Mode=Require;Trust Server Certificate=true;Pooling=true"
   }
 }
 
@@ -473,16 +493,19 @@ builder.Services.AddDbContext<ApplicationDbContext>(options =>
 );
 ```
 
-> **Importante con NeonDB:** Habilitar **connection pooling** vía PgBouncer (NeonDB lo ofrece de forma nativa en la URL de conexión con `;Pooling=true`). Evitar mantener conexiones abiertas largas.
+> **Importante con NeonDB:** Habilitar connection pooling vía PgBouncer (parámetro `Pooling=true` en la URL). Evitar mantener conexiones abiertas largas.
 
 ---
 
-## 4. Frontend — Angular
+## 4. Frontend — React + Vite + TypeScript
 
-### 4.1 Modelo TypeScript (interfaces)
+> El frontend usa **React 18 + React Router v7 + Tailwind CSS 4 + Clerk** para auth. No usa Angular.  
+> El onboarding vive en `frontend/src/app/dashboard/page.tsx`.
+
+### 4.1 Tipos TypeScript
 
 ```typescript
-// models/onboarding.model.ts
+// types/onboarding.ts
 
 export interface OnboardingStep {
   id: string;
@@ -502,460 +525,258 @@ export interface OnboardingStatus {
 
 ---
 
-### 4.2 Servicio Angular
+### 4.2 Hook personalizado
 
 ```typescript
-// services/onboarding.service.ts
-import { Injectable, inject } from '@angular/core';
-import { HttpClient } from '@angular/common/http';
-import { Observable } from 'rxjs';
-import { OnboardingStatus } from '../models/onboarding.model';
-import { environment } from '../../environments/environment';
+// hooks/useOnboarding.ts
+import { useState, useEffect } from "react";
+import { useAuth } from "./useAuth";
+import type { OnboardingStatus } from "../types/onboarding";
 
-@Injectable({ providedIn: 'root' })
-export class OnboardingService {
-  private http = inject(HttpClient);
-  private readonly base = `${environment.apiUrl}/api/onboarding`;
+const STORAGE_KEY = "onboarding_dismissed";
 
-  getStatus(): Observable<OnboardingStatus> {
-    return this.http.get<OnboardingStatus>(`${this.base}/status`);
-  }
+export function useOnboarding() {
+  const { getToken } = useAuth();
+  const [status, setStatus] = useState<OnboardingStatus | null>(null);
+  const [loading, setLoading] = useState(true);
 
-  dismiss(): Observable<void> {
-    return this.http.patch<void>(`${this.base}/dismiss`, {});
-  }
-}
-```
+  const [dismissed, setDismissed] = useState(
+    () => localStorage.getItem(STORAGE_KEY) === "true"
+  );
 
----
+  useEffect(() => {
+    fetchStatus();
+  }, []);
 
-### 4.3 Componente Standalone (Angular 17+)
-
-```typescript
-// components/onboarding-card/onboarding-card.component.ts
-import {
-  Component, OnInit, ChangeDetectionStrategy, signal, computed, inject
-} from '@angular/core';
-import { Router } from '@angular/router';
-import { CommonModule } from '@angular/common';
-import { OnboardingService } from '../../services/onboarding.service';
-import { OnboardingStatus, OnboardingStep } from '../../models/onboarding.model';
-
-@Component({
-  selector: 'app-onboarding-card',
-  standalone: true,
-  imports: [CommonModule],
-  changeDetection: ChangeDetectionStrategy.OnPush,
-  templateUrl: './onboarding-card.component.html',
-  styleUrl: './onboarding-card.component.scss'
-})
-export class OnboardingCardComponent implements OnInit {
-  private onboardingService = inject(OnboardingService);
-  private router            = inject(Router);
-
-  // Signals para reactividad eficiente
-  status    = signal<OnboardingStatus | null>(null);
-  loading   = signal(true);
-
-  // Computed values
-  allCompleted = computed(() => {
-    const s = this.status();
-    return s ? s.completedCount === s.totalSteps : false;
-  });
-
-  progressPercent = computed(() => {
-    const s = this.status();
-    if (!s || s.totalSteps === 0) return 0;
-    return Math.round((s.completedCount / s.totalSteps) * 100);
-  });
-
-  showCard = computed(() => {
-    const s = this.status();
-    return s !== null && !s.dismissed && !this.allCompleted();
-  });
-
-  ngOnInit(): void {
-    this.loadStatus();
-  }
-
-  private loadStatus(): void {
-    this.loading.set(true);
-    this.onboardingService.getStatus().subscribe({
-      next: (data) => {
-        this.status.set(data);
-        this.loading.set(false);
-      },
-      error: () => this.loading.set(false)
-    });
-  }
-
-  navigateToStep(step: OnboardingStep): void {
-    if (!step.completed && step.href) {
-      this.router.navigateByUrl(step.href);
+  async function fetchStatus() {
+    setLoading(true);
+    try {
+      const token = await getToken();
+      const res = await fetch(`${import.meta.env.VITE_API_URL}/api/onboarding/status`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data: OnboardingStatus = await res.json();
+      setStatus(data);
+      if (data.dismissed) persistDismiss();
+    } finally {
+      setLoading(false);
     }
   }
 
-  dismiss(): void {
-    this.onboardingService.dismiss().subscribe(() => {
-      const current = this.status();
-      if (current) {
-        this.status.set({ ...current, dismissed: true });
-      }
+  async function dismiss() {
+    persistDismiss();
+    const token = await getToken();
+    await fetch(`${import.meta.env.VITE_API_URL}/api/onboarding/dismiss`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${token}` },
     });
   }
 
-  trackByStepId(_: number, step: OnboardingStep): string {
-    return step.id;
+  function persistDismiss() {
+    localStorage.setItem(STORAGE_KEY, "true");
+    setDismissed(true);
   }
+
+  const allCompleted = status ? status.completedCount === status.totalSteps : false;
+  const showCard = !dismissed && !allCompleted && status !== null;
+
+  return { status, loading, showCard, allCompleted, dismiss };
 }
 ```
 
 ---
 
-### 4.4 Template Angular (accesible)
+### 4.3 Componente React (accesible)
 
-```html
-<!-- onboarding-card.component.html -->
-@if (showCard()) {
-  <div class="onboarding-card" role="region" aria-label="Getting started checklist">
+```tsx
+// components/OnboardingCard.tsx
+import { useNavigate } from "react-router-dom";
+import { Check, ChevronRight, Zap } from "lucide-react";
+import { useOnboarding } from "../hooks/useOnboarding";
+import type { OnboardingStep } from "../types/onboarding";
 
-    <!-- Header -->
-    <div class="onboarding-header">
-      <div class="onboarding-title-group">
-        <div class="onboarding-icon" aria-hidden="true">⚡</div>
-        <div>
-          <h2 class="onboarding-title">Getting started</h2>
-          <p
-            class="onboarding-subtitle"
-            aria-live="polite"
-            aria-atomic="true"
-          >
-            {{ status()?.completedCount }} of {{ status()?.totalSteps }} completed
-          </p>
-        </div>
-      </div>
+export function OnboardingCard() {
+  const navigate = useNavigate();
+  const { status, showCard, dismiss } = useOnboarding();
 
-      <div class="onboarding-controls">
-        <!-- Progress bar -->
-        <div
-          role="progressbar"
-          [attr.aria-valuenow]="status()?.completedCount"
-          [attr.aria-valuemin]="0"
-          [attr.aria-valuemax]="status()?.totalSteps"
-          aria-label="Setup progress"
-          class="progress-container"
-        >
-          <div class="progress-track">
-            <div
-              class="progress-fill"
-              [style.width.%]="progressPercent()"
-            ></div>
+  if (!showCard || !status) return null;
+
+  const { steps, completedCount, totalSteps } = status;
+  const progressPercent = Math.round((completedCount / totalSteps) * 100);
+
+  function handleStepClick(step: OnboardingStep) {
+    if (!step.completed && step.href) navigate(step.href);
+  }
+
+  return (
+    <div
+      className="rounded-2xl border border-primary/20 bg-primary/5 p-5"
+      role="region"
+      aria-label="Getting started checklist"
+    >
+      {/* Header */}
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-3">
+          <div className="w-8 h-8 rounded-xl bg-primary/15 flex items-center justify-center" aria-hidden="true">
+            <Zap className="w-4 h-4 text-primary" />
           </div>
-          <span class="progress-text">{{ progressPercent() }}%</span>
-        </div>
-
-        <!-- Dismiss button -->
-        <button
-          class="dismiss-btn"
-          (click)="dismiss()"
-          aria-label="Dismiss getting started checklist"
-          type="button"
-        >
-          Dismiss
-        </button>
-      </div>
-    </div>
-
-    <!-- Steps grid -->
-    <div class="steps-grid">
-      @for (step of status()?.steps; track trackByStepId($index, step)) {
-        <button
-          class="step-item"
-          [class.step-completed]="step.completed"
-          [class.step-pending]="!step.completed && step.href"
-          [disabled]="step.completed || !step.href"
-          (click)="navigateToStep(step)"
-          [attr.aria-label]="step.label + ': ' + (step.completed ? 'completed' : 'pending')"
-          type="button"
-        >
-          <!-- Check indicator -->
-          <div
-            class="step-indicator"
-            [class.step-indicator--done]="step.completed"
-            aria-hidden="true"
-          >
-            @if (step.completed) {
-              <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-                <path d="M2 6l3 3 5-5" stroke="white" stroke-width="2"
-                      stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-            }
-          </div>
-
-          <!-- Step text -->
-          <div class="step-content">
-            <p class="step-label" [class.step-label--done]="step.completed">
-              {{ step.label }}
+          <div>
+            <h2 className="text-sm font-semibold text-text">Getting started</h2>
+            <p
+              className="text-xs text-muted"
+              aria-live="polite"
+              aria-atomic="true"
+            >
+              {completedCount} of {totalSteps} completed
             </p>
-            @if (!step.completed) {
-              <p class="step-description">{{ step.description }}</p>
-            }
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3">
+          {/* Progress bar — accesible */}
+          <div
+            role="progressbar"
+            aria-valuenow={completedCount}
+            aria-valuemin={0}
+            aria-valuemax={totalSteps}
+            aria-label="Setup progress"
+            className="flex items-center gap-2"
+          >
+            <div className="w-28 h-1.5 rounded-full bg-border overflow-hidden">
+              <div
+                className="h-full rounded-full bg-primary transition-all duration-700"
+                style={{ width: `${progressPercent}%` }}
+              />
+            </div>
+            <span className="text-xs font-medium text-primary">{progressPercent}%</span>
           </div>
 
-          <!-- Chevron -->
-          @if (!step.completed && step.href) {
-            <svg class="step-chevron" width="16" height="16" viewBox="0 0 16 16"
-                 fill="none" aria-hidden="true">
-              <path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.5"
-                    stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          }
-        </button>
-      }
-    </div>
+          {/* Dismiss — mínimo 44px touch target */}
+          <button
+            onClick={dismiss}
+            className="text-xs text-muted hover:text-text transition-colors px-3 py-2.5 min-h-[44px] rounded-lg hover:bg-card"
+            aria-label="Dismiss getting started checklist"
+            type="button"
+          >
+            Dismiss
+          </button>
+        </div>
+      </div>
 
-  </div>
+      {/* Steps grid */}
+      <div className="grid gap-2 sm:grid-cols-2">
+        {steps.map(step => (
+          <button
+            key={step.id}
+            onClick={() => handleStepClick(step)}
+            disabled={step.completed || !step.href}
+            aria-label={`${step.label}: ${step.completed ? "completado" : "pendiente"}`}
+            type="button"
+            className={`flex items-center gap-3 p-3 rounded-xl text-left transition-all w-full border ${
+              step.completed
+                ? "opacity-50 cursor-default border-transparent"
+                : step.href
+                  ? "hover:bg-card cursor-pointer border-transparent hover:border-border"
+                  : "cursor-default border-transparent"
+            }`}
+          >
+            {/* Indicator */}
+            <div
+              className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 transition-all duration-300 ${
+                step.completed ? "bg-primary scale-105" : "border-2 border-border bg-card"
+              }`}
+              aria-hidden="true"
+            >
+              {step.completed && <Check className="w-3 h-3 text-white" />}
+            </div>
+
+            {/* Text */}
+            <div className="flex-1 min-w-0">
+              <p className={`text-sm font-medium ${step.completed ? "line-through text-muted" : "text-text"}`}>
+                {step.label}
+              </p>
+              {!step.completed && (
+                <p className="text-xs text-muted truncate">{step.description}</p>
+              )}
+            </div>
+
+            {/* Chevron affordance */}
+            {!step.completed && step.href && (
+              <ChevronRight className="w-4 h-4 text-muted shrink-0" aria-hidden="true" />
+            )}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
 }
 ```
 
 ---
 
-### 4.5 Estilos SCSS
+### 4.4 Integración en el Dashboard
 
-```scss
-// onboarding-card.component.scss
+```tsx
+// app/dashboard/page.tsx — añadir componente donde hoy está el card inline
+import { OnboardingCard } from "../../components/OnboardingCard";
 
-.onboarding-card {
-  border-radius: 1rem;
-  border: 1px solid color-mix(in srgb, var(--color-primary) 20%, transparent);
-  background: color-mix(in srgb, var(--color-primary) 5%, transparent);
-  padding: 1.25rem;
-}
+export default function DashboardPage() {
+  // ... resto del estado del dashboard ...
 
-.onboarding-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 1rem;
-  gap: 1rem;
-  flex-wrap: wrap;
-}
+  return (
+    <div className="space-y-6 max-w-7xl mx-auto">
+      {/* Header */}
+      <DashboardHeader user={user} onManageProviders={() => navigate("/dashboard/providers")} />
 
-.onboarding-title-group {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-}
+      {/* Alerta de provider inactivo */}
+      {metrics.providerError && <ProviderErrorAlert onFix={() => navigate("/dashboard/providers")} />}
 
-.onboarding-icon {
-  width: 2rem;
-  height: 2rem;
-  border-radius: 0.75rem;
-  background: color-mix(in srgb, var(--color-primary) 15%, transparent);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 1rem;
-}
+      {/* Onboarding — se auto-oculta */}
+      <OnboardingCard />
 
-.onboarding-title {
-  font-size: 0.875rem;
-  font-weight: 600;
-  margin: 0;
-}
+      {/* Métricas */}
+      <MetricCards metrics={metrics} />
 
-.onboarding-subtitle {
-  font-size: 0.75rem;
-  color: var(--color-muted);
-  margin: 0;
-}
+      {/* Acciones rápidas */}
+      <QuickActions />
 
-.onboarding-controls {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-}
-
-// Progress bar — accesible con role="progressbar"
-.progress-container {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-.progress-track {
-  width: 7rem;
-  height: 0.375rem;
-  border-radius: 9999px;
-  background: var(--color-border);
-  overflow: hidden;
-}
-
-.progress-fill {
-  height: 100%;
-  border-radius: 9999px;
-  background: var(--color-primary);
-  transition: width 700ms ease;
-}
-
-.progress-text {
-  font-size: 0.75rem;
-  font-weight: 500;
-  color: var(--color-primary);
-}
-
-// Dismiss button — mínimo 44px de touch target
-.dismiss-btn {
-  font-size: 0.75rem;
-  color: var(--color-muted);
-  background: transparent;
-  border: none;
-  border-radius: 0.5rem;
-  padding: 0.5rem 0.75rem;        // ~44px alto en la mayoría de viewports
-  min-height: 2.75rem;            // 44px explícito
-  cursor: pointer;
-  transition: color 0.15s, background 0.15s;
-
-  &:hover {
-    color: var(--color-text);
-    background: var(--color-card);
-  }
-
-  &:focus-visible {
-    outline: 2px solid var(--color-primary);
-    outline-offset: 2px;
-  }
-}
-
-// Steps grid
-.steps-grid {
-  display: grid;
-  gap: 0.5rem;
-  grid-template-columns: 1fr;
-
-  @media (min-width: 640px) {
-    grid-template-columns: 1fr 1fr;
-  }
-}
-
-// Step item — button para accesibilidad de teclado
-.step-item {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  padding: 0.75rem;
-  border-radius: 0.75rem;
-  border: 1px solid transparent;
-  background: transparent;
-  text-align: left;
-  cursor: default;
-  transition: background 0.15s, border-color 0.15s;
-  width: 100%;
-
-  &.step-completed {
-    opacity: 0.5;
-  }
-
-  &.step-pending {
-    cursor: pointer;
-
-    &:hover {
-      background: var(--color-card);
-      border-color: var(--color-border);
-    }
-
-    &:focus-visible {
-      outline: 2px solid var(--color-primary);
-      outline-offset: 2px;
-    }
-  }
-
-  &:disabled {
-    cursor: default;
-  }
-}
-
-// Indicator circle / checkmark
-.step-indicator {
-  width: 1.5rem;
-  height: 1.5rem;
-  border-radius: 50%;
-  border: 2px solid var(--color-border);
-  background: var(--color-card);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  transition: background 0.3s, border-color 0.3s, transform 0.3s;
-
-  &--done {
-    background: var(--color-primary);
-    border-color: var(--color-primary);
-    transform: scale(1.05);
-  }
-}
-
-.step-content {
-  flex: 1;
-  min-width: 0;
-}
-
-.step-label {
-  font-size: 0.875rem;
-  font-weight: 500;
-  color: var(--color-text);
-  margin: 0;
-
-  &--done {
-    text-decoration: line-through;
-    color: var(--color-muted);
-  }
-}
-
-.step-description {
-  font-size: 0.75rem;
-  color: var(--color-muted);
-  margin: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.step-chevron {
-  color: var(--color-muted);
-  flex-shrink: 0;
+      {/* Actividad reciente */}
+      <RecentActivity messages={recentMessages} />
+    </div>
+  );
 }
 ```
 
 ---
 
-### 4.6 Integración en el Dashboard
+### 4.5 Skeleton de carga (P3 fix)
 
-```typescript
-// dashboard.component.ts
-import { Component } from '@angular/core';
-import { OnboardingCardComponent } from '../../components/onboarding-card/onboarding-card.component';
-
-@Component({
-  selector: 'app-dashboard',
-  standalone: true,
-  imports: [OnboardingCardComponent],
-  template: `
-    <div class="dashboard-layout">
-      <!-- Header -->
-      <app-dashboard-header />
-
-      <!-- Onboarding — se auto-oculta -->
-      <app-onboarding-card />
-
-      <!-- Resto del dashboard -->
-      <app-metrics-grid />
-      <app-quick-actions />
-      <app-recent-activity />
+```tsx
+// components/OnboardingCardSkeleton.tsx
+export function OnboardingCardSkeleton() {
+  return (
+    <div className="rounded-2xl border border-primary/20 bg-primary/5 p-5 animate-pulse">
+      <div className="flex items-center gap-3 mb-4">
+        <div className="w-8 h-8 rounded-xl bg-primary/20" />
+        <div className="space-y-1.5">
+          <div className="h-3.5 w-28 bg-primary/15 rounded" />
+          <div className="h-3 w-20 bg-muted/20 rounded" />
+        </div>
+      </div>
+      <div className="grid gap-2 sm:grid-cols-2">
+        {[...Array(4)].map((_, i) => (
+          <div key={i} className="flex items-center gap-3 p-3 rounded-xl">
+            <div className="w-6 h-6 rounded-full bg-border shrink-0" />
+            <div className="flex-1 space-y-1.5">
+              <div className="h-3.5 w-3/4 bg-border rounded" />
+              <div className="h-3 w-1/2 bg-border/60 rounded" />
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
-  `
-})
-export class DashboardComponent {}
+  );
+}
 ```
 
 ---
@@ -966,7 +787,7 @@ export class DashboardComponent {}
 USUARIO LLEGA AL DASHBOARD
         │
         ▼
-GET /api/onboarding/status
+GET /api/onboarding/status   (o via Promise.allSettled del dashboard)
         │
         ▼
  ┌──────────────────────────────────────────────────┐
@@ -974,10 +795,10 @@ GET /api/onboarding/status
  │                                                    │
  │  Parallel queries a NeonDB (EF Core):             │
  │  ├── UserOnboardings WHERE user_id = {userId}     │
+ │  ├── Providers COUNT WHERE user_id = {userId}     │
  │  ├── ApiKeys COUNT WHERE user_id = {userId}       │
- │  ├── Messages COUNT WHERE user_id = {userId}      │
  │  ├── Domains ANY WHERE verified = true            │
- │  ├── OrganizationMembers COUNT                    │
+ │  ├── OrganizationMembers COUNT (Pro/Agency)       │
  │  └── UserBillings.Plan                            │
  └──────────────────────────────────────────────────┘
         │
@@ -985,34 +806,34 @@ GET /api/onboarding/status
  Devuelve: { dismissed, completedCount, totalSteps, steps[] }
         │
         ▼
- Angular: status signal actualizado
+ React: status actualizado → showCard = !dismissed && !allCompleted
         │
-        ▼
- showCard = !dismissed && !allCompleted
-        │
-        ├── true  → renderiza OnboardingCard
-        └── false → oculta card silenciosamente
+        ├── true  → renderiza <OnboardingCard />
+        └── false → null (sin espacio en layout)
 
 USUARIO HACE CLIC EN UN STEP
         │
         ▼
- router.navigateByUrl(step.href)
- (el usuario realiza la acción — ej. crea API key)
+ navigate(step.href)
+ (ej: /dashboard/providers → conecta Resend → vuelve al dashboard)
         │
         ▼
- Al volver al dashboard → ngOnInit() → loadStatus()
- → step aparece como completado
+ useEffect → fetchStatus() → step aparece como completado
 
 USUARIO HACE CLIC EN "DISMISS"
         │
         ▼
-PATCH /api/onboarding/dismiss
+ localStorage.setItem("onboarding_dismissed", "true")   ← inmediato
+ PATCH /api/onboarding/dismiss                          ← async, sin bloquear UI
         │
         ▼
- DB: user_onboarding.dismissed = true
+ dismissed = true → showCard = false → card desaparece sin reload
+
+TODOS LOS STEPS COMPLETADOS
         │
         ▼
- Signal actualizado → showCard = false → card se oculta
+ allCompleted = true → useEffect dispara dismiss() automáticamente
+ → card se oculta sin acción del usuario
 ```
 
 ---
@@ -1021,13 +842,20 @@ PATCH /api/onboarding/dismiss
 
 Antes de considerar el onboarding como completo, verificar:
 
+### Steps correctos
+- [ ] El paso `provider` ("Connect your first provider") existe y es el **segundo paso** (tras account)
+- [ ] El paso `api_key` se completa cuando hay al menos una key no revocada
+- [ ] El paso `domain` se completa cuando `domains.some(d => d.verified)` es true
+- [ ] No hay paso "Send your first email" — esa ruta (`/dashboard/send`) no está implementada
+- [ ] El paso `invite_member` solo aparece para planes Pro y Agency
+
 ### Funcionalidad
-- [ ] El estado `dismissed` persiste en base de datos (no solo en memoria/localStorage)
+- [ ] El estado `dismissed` persiste en base de datos (PATCH /api/onboarding/dismiss)
+- [ ] Fallback a localStorage mientras el backend no esté listo
 - [ ] Todos los steps calculan su completitud desde datos reales del backend
-- [ ] Los steps condicionales (por plan) se evalúan correctamente
 - [ ] Al completar todos los steps, la card se oculta automáticamente
 - [ ] El dismiss funciona sin recargar la página
-- [ ] Refreshing la página mantiene el estado correcto (dismissed/not dismissed)
+- [ ] Refreshing la página mantiene el estado correcto
 
 ### Accesibilidad (WCAG 2.1 AA)
 - [ ] Los steps clickeables son elementos `<button>` (no `<div>` con onClick)
@@ -1038,22 +866,22 @@ Antes de considerar el onboarding como completo, verificar:
 - [ ] La navegación por teclado (Tab + Enter) funciona en todos los steps
 
 ### Touch & Interacción
-- [ ] El botón Dismiss tiene mínimo `44×44px` de área de toque
+- [ ] El botón Dismiss tiene mínimo `44×44px` de área de toque (`min-h-[44px]`)
 - [ ] Los steps tienen mínimo `44px` de alto como touch target
 - [ ] Existe feedback visual en hover y focus en items clickeables
 
 ### Rendimiento
-- [ ] Las queries al backend se lanzan en paralelo (`Task.WhenAll`)
-- [ ] Existe un estado de carga (skeleton o spinner) mientras se obtienen datos
-- [ ] La progress bar tiene `transition` suave (no snap)
+- [ ] Las queries al backend se lanzan en paralelo (`Task.WhenAll` en C# / `Promise.allSettled` en React)
+- [ ] Existe un skeleton de carga mientras se obtienen datos (no solo spinner global)
+- [ ] La progress bar tiene `transition-all duration-700` suave
 - [ ] NeonDB connection pooling habilitado para evitar latencia por cold starts
 
 ### Diseño
 - [ ] La card desaparece limpiamente (sin salto de layout) cuando se descarta
-- [ ] Los steps completados muestran estado visual diferenciado (check + opacidad)
+- [ ] Los steps completados muestran estado visual diferenciado (check + opacidad + line-through)
 - [ ] Los steps pendientes con href muestran chevron como affordance de click
 - [ ] La card no bloquea ni interfiere con el contenido del dashboard
 
 ---
 
-*Documento generado a partir de la auditoría de Sendix Frontend — 2026-06-10*
+*Documento actualizado el 2026-06-11 — refleja la implementación real de Sendix Frontend (React + Vite + TS + Clerk)*

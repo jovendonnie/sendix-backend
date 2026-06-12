@@ -78,5 +78,5 @@ jobs:
             # Reiniciar solo el contenedor del backend
             docker compose -f docker-compose.prod.yml up -d --no-deps --force-recreate backend
 
-            # Limpiar imágenes antiguas
-            docker image prune -f
+            # Limpiar imágenes y capas antiguas
+            docker system prune -af
