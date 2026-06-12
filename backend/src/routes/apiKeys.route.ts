@@ -2,7 +2,7 @@ import { Router, Response } from 'express'
 import { apiKeyService } from '../services/apiKey.service'
 import { db } from '../lib/db'
 import { checkApiKeyLimit } from '../middleware/checkPlanLimits'
-import { authSupabaseUser, UserRequest } from '../middleware/authSupabaseUser'
+import { authClerkUser as authSupabaseUser, UserRequest } from '../middleware/authClerkUser'
 import { invalidateKeyCacheById } from '../middleware/authApiKey'
 
 const router = Router()

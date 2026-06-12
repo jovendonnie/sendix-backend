@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express'
 import { stripe, PLANS } from '../lib/stripe'
 import { db } from '../lib/db'
-import { authSupabaseUser, UserRequest } from '../middleware/authSupabaseUser'
+import { authClerkUser as authSupabaseUser, UserRequest } from '../middleware/authClerkUser'
 
 const router = Router()
 
