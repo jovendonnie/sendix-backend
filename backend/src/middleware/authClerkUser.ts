@@ -42,6 +42,13 @@ export async function authClerkUser(
       return
     }
 
+    // Guarantee the profiles row exists — handles users who signed up before
+    // the Clerk webhook was configured, or if the webhook failed silently.
+    await db.query(
+      `INSERT INTO profiles (id, plan) VALUES ($1, 'free') ON CONFLICT (id) DO NOTHING`,
+      [payload.sub]
+    )
+
     const { rows } = await db.query('SELECT plan FROM profiles WHERE id = $1', [payload.sub])
     const userPlan = rows[0]?.plan || 'free'
 

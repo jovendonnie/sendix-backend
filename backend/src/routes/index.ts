@@ -1,4 +1,5 @@
 import express, { Router, Request, Response } from 'express'
+import { authClerkUser, UserRequest } from '../middleware/authClerkUser'
 import healthRouter       from './health.route'
 import apiKeysRouter      from './apiKeys.route'
 import sendRouter         from './send.route'
@@ -53,6 +54,11 @@ router.use('/providers', providersRouter)
 
 // Events (normalized, Clerk JWT auth)
 router.use('/events', eventsRouter)
+
+// User sync — called by frontend on login to ensure profiles row exists
+router.post('/users/sync', authClerkUser, (req: UserRequest, res: Response) => {
+  res.json({ ok: true, userId: req.userId })
+})
 
 /**
  * GET /api/hello
