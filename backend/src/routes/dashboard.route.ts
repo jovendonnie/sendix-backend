@@ -137,9 +137,9 @@ router.post('/test-send', authClerkUser, async (req: UserRequest, res: Response)
     }
 
     const { rows: msgRows } = await db.query(
-      `INSERT INTO messages (user_id, to_email, subject, html, status)
-       VALUES ($1, $2, $3, $4, 'pending') RETURNING id`,
-      [userId, to, subject, html]
+      `INSERT INTO messages (user_id, to_email, from_email, subject, html, status)
+       VALUES ($1, $2, $3, $4, $5, 'pending') RETURNING id`,
+      [userId, to, 'noreply@sendix.lat', subject, html]
     )
     messageId = msgRows[0]?.id
 
