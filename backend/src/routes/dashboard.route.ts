@@ -127,6 +127,7 @@ router.post('/send-email', authClerkUser, async (req: UserRequest, res: Response
  * Used by the Providers page test-send panel in the dashboard.
  */
 router.post('/test-send', authClerkUser, async (req: UserRequest, res: Response) => {
+  let messageId: string | null = null
   try {
     const userId = req.userId!
     const { to, subject, html } = req.body
@@ -135,20 +136,48 @@ router.post('/test-send', authClerkUser, async (req: UserRequest, res: Response)
       return res.status(400).json({ error: 'Missing required fields: to, subject, html' })
     }
 
+    const { rows: msgRows } = await db.query(
+      `INSERT INTO messages (user_id, to_email, subject, html, status)
+       VALUES ($1, $2, $3, $4, 'pending') RETURNING id`,
+      [userId, to, subject, html]
+    )
+    messageId = msgRows[0]?.id
+
     const result = await orchestrateEmail(
       { to, from: undefined, subject, html },
       userId
     )
 
     if (!result.success) {
+      if (messageId) {
+        await db.query(
+          "UPDATE messages SET status = 'failed', final_status = 'failed', provider_used = $1 WHERE id = $2",
+          [result.provider_used ?? null, messageId]
+        )
+      }
       return res.status(500).json({ error: result.error || 'Email send failed' })
+    }
+
+    if (messageId) {
+      await db.query(
+        `UPDATE messages SET status = 'sent', final_status = 'sent', provider_used = $1,
+         provider_message_id = $2, retry_count = $3 WHERE id = $4`,
+        [result.provider_used ?? null, result.messageId ?? null, result.retry_count ?? 0, messageId]
+      )
+      await db.query(
+        'INSERT INTO logs (message_id, status, provider) VALUES ($1, $2, $3)',
+        [messageId, 'sent', result.provider_used ?? 'unknown']
+      )
     }
 
     incrementEmailCounter(userId, 1).catch(() => {})
 
-    return res.json({ success: true, provider_used: result.provider_used, message_id: result.messageId })
+    return res.json({ success: true, provider_used: result.provider_used, message_id: messageId })
   } catch (err) {
     console.error('[dashboard/test-send] error:', err)
+    if (messageId) {
+      await db.query("UPDATE messages SET status = 'failed', final_status = 'failed' WHERE id = $1", [messageId]).catch(() => {})
+    }
     return res.status(500).json({ error: 'Internal server error' })
   }
 })
