@@ -2,6 +2,7 @@ import { Router, Response } from 'express'
 import { db } from '../lib/db'
 import { authClerkUser, UserRequest } from '../middleware/authClerkUser'
 import { sendEmail } from '../services/email.service'
+import { orchestrateEmail } from '../services/orchestrator.service'
 import { incrementEmailCounter } from '../middleware/checkPlanLimits'
 
 const router = Router()
@@ -116,6 +117,38 @@ router.post('/send-email', authClerkUser, async (req: UserRequest, res: Response
     return res.json({ success: true, messageId })
   } catch (err) {
     console.error('[dashboard/send-email] error:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+/**
+ * POST /api/dashboard/test-send
+ * Sends a test email through the user's configured providers (Clerk JWT auth).
+ * Used by the Providers page test-send panel in the dashboard.
+ */
+router.post('/test-send', authClerkUser, async (req: UserRequest, res: Response) => {
+  try {
+    const userId = req.userId!
+    const { to, subject, html } = req.body
+
+    if (!to || !subject || !html) {
+      return res.status(400).json({ error: 'Missing required fields: to, subject, html' })
+    }
+
+    const result = await orchestrateEmail(
+      { to, from: undefined, subject, html },
+      userId
+    )
+
+    if (!result.success) {
+      return res.status(500).json({ error: result.error || 'Email send failed' })
+    }
+
+    incrementEmailCounter(userId, 1).catch(() => {})
+
+    return res.json({ success: true, provider_used: result.provider_used, message_id: result.messageId })
+  } catch (err) {
+    console.error('[dashboard/test-send] error:', err)
     return res.status(500).json({ error: 'Internal server error' })
   }
 })
