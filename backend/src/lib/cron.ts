@@ -2,6 +2,7 @@ import { db } from './db'
 
 let _started = false
 let _cronTimer: ReturnType<typeof setInterval> | null = null
+let _lastResetMonth = ''
 
 async function resetMonthlyEmailCounters(): Promise<void> {
   const now = new Date()
@@ -9,7 +10,6 @@ async function resetMonthlyEmailCounters(): Promise<void> {
   console.log(`[cron] Running monthly email counter reset at ${now.toISOString()}`)
 
   try {
-    // Only reset profiles whose billing_period_start is from a previous month
     const result = await db.query(
       `UPDATE profiles
        SET emails_sent_this_month = 0, billing_period_start = $1
@@ -17,28 +17,21 @@ async function resetMonthlyEmailCounters(): Promise<void> {
          AND (billing_period_start IS NULL OR to_char(billing_period_start, 'YYYY-MM') < $2)`,
       [now.toISOString(), currentMonth]
     )
+    _lastResetMonth = currentMonth
     console.log(`[cron] Reset complete — ${result.rowCount ?? 0} profiles updated`)
   } catch (err) {
     console.error('[cron] Unexpected error during reset:', err)
   }
 }
 
-function msUntilNextFirstOfMonth(): number {
-  const now  = new Date()
-  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 0, 0, 0, 0))
-  return Math.max(next.getTime() - now.getTime(), 60_000)
-}
+// Polls every hour — avoids the 32-bit setTimeout overflow (~24.8 day limit)
+async function tick(): Promise<void> {
+  const now = new Date()
+  const currentMonth = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`
 
-function scheduleNextRun(): void {
-  const msUntilFirst = msUntilNextFirstOfMonth()
-  const daysUntil    = Math.floor(msUntilFirst / 1000 / 60 / 60 / 24)
-  console.log(`[cron] Next monthly reset in ${daysUntil} day(s)`)
-
-  _cronTimer = setTimeout(async () => {
-    _cronTimer = null
+  if (now.getUTCDate() === 1 && _lastResetMonth !== currentMonth) {
     await resetMonthlyEmailCounters()
-    scheduleNextRun()
-  }, msUntilFirst) as unknown as ReturnType<typeof setInterval>
+  }
 }
 
 export function startMonthlyCron(): void {
@@ -47,12 +40,17 @@ export function startMonthlyCron(): void {
     return
   }
   _started = true
-  scheduleNextRun()
+
+  const now = new Date()
+  const daysUntil = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)).getDate() - now.getUTCDate()
+  console.log(`[cron] Monthly reset polling started — next 1st of month in ~${daysUntil} day(s)`)
+
+  _cronTimer = setInterval(tick, 60 * 60 * 1_000) // check every hour
 }
 
 export function stopMonthlyCron(): void {
   if (_cronTimer) {
-    clearTimeout(_cronTimer as unknown as ReturnType<typeof setTimeout>)
+    clearInterval(_cronTimer)
     _cronTimer = null
     _started = false
     console.log('[cron] Monthly cron stopped')
